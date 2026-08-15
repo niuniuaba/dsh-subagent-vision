@@ -37,9 +37,6 @@ dsh plugin --profile web add github:niuniuaba/dsh-subagent-vision
 # 从 GitHub 安装（显式 git URL）
 dsh plugin --profile web add git+https://github.com/niuniuaba/dsh-subagent-vision.git
 
-# 发布到 npm 后
-dsh plugin --profile web add dsh-subagent-vision
-
 # 本地目录
 dsh plugin --profile web add /path/to/plugins/dsh-subagent-vision
 ```

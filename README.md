@@ -37,9 +37,6 @@ dsh plugin --profile web add github:niuniuaba/dsh-subagent-vision
 # from GitHub (explicit git URL)
 dsh plugin --profile web add git+https://github.com/niuniuaba/dsh-subagent-vision.git
 
-# from npm once published
-dsh plugin --profile web add dsh-subagent-vision
-
 # from a local checkout
 dsh plugin --profile web add /path/to/plugins/dsh-subagent-vision
 ```
