@@ -2,7 +2,7 @@
 
 English | [中文](README.zh-CN.md)
 
-A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) bundle plugin that lets a **text-only** main agent (DeepSeek) read images **in the same session**: when a task needs vision, the main agent delegates to a fresh subagent routed to a **vision-capable model you pick in the settings** (configured under Settings > Models, chosen under Settings > 视觉处理模型; no default model is shipped), and the child's text result is merged back. **Pasting or dropping an image just works**: intake stays native (thumbnail rail, remove/undo); when you hit send on a text-only session, the browser half uploads each draft image to a private temp file and appends the paths to your prompt, so the request never trips image admission and the text-only agent can delegate the paths to the vision subagent. No model switching, no second session, no copy-paste.
+A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) bundle plugin that lets a **text-only** main agent (DeepSeek) read images **in the same session**: when a task needs vision, the main agent delegates to a fresh subagent routed to a **vision-capable model you pick in the settings** (configured under Settings > Models, chosen under Settings > 视觉处理模型; the shipped patch pins a baseline route so it works out of the box — see [Configure](#configure)), and the child's text result is merged back. **Pasting or dropping an image just works**: intake stays native (thumbnail rail, remove/undo); when you hit send on a text-only session, the browser half uploads each draft image to a private temp file and appends the paths to your prompt, so the request never trips image admission and the text-only agent can delegate the paths to the vision subagent. No model switching, no second session, no copy-paste.
 
 ## Why
 
@@ -12,10 +12,10 @@ DeepSeek chat models cannot take image input, and the harness refuses to switch 
 
 The bundle's `cordis.patch.yml` inserts two rows into the profile composition:
 
-- **`tool-subagent-vision`** — a second `@deepseek-ai/dsh-tool-subagent` instance (`toolName: subagent_vision`, `provider: spawn`, `backgroundMode: one-shot`). This bundle ships **no default model**: until the user picks one in the settings, the row carries no `agentOptions`. Image blocks never enter the parent's session: the parent passes a **file path or URL** in the tool prompt, the vision child reads it with its own `read_image` tool (its execution gate checks the *child's* routed model, which declares image input), and only the child's final **text** returns as the tool result.
+- **`tool-subagent-vision`** — a second `@deepseek-ai/dsh-tool-subagent` instance (`toolName: subagent_vision`, `provider: spawn`, `backgroundMode: one-shot`). The row starts with an `agentOptions` baseline pinned in the shipped `cordis.patch.yml` (qwen/qwen3.8-max) so the tool works out of the box; picking a different model in Settings > 视觉处理模型 rewrites that file (the new route applies from the next restart, and immediately too when the live sync works), and deployments that never want a baseline can override the row in their profile's `cordis.patch.yml` (later patch layers win). Image blocks never enter the parent's session: the parent passes a **file path or URL** in the tool prompt, the vision child reads it with its own `read_image` tool (its execution gate checks the *child's* routed model, which declares image input), and only the child's final **text** returns as the tool result.
 - **`subagent-vision`** — this package's root plugin, which does three things:
   - **Guidance**: registers one prompt section telling the model when to use `subagent_vision` (the stock subagent tool description says nothing about vision). With no route configured it tells the model *not* to call the tool and to ask the user to configure one first.
-  - **Vision-route settings**: a settings section (`subagent-vision` namespace, persisted in `settings.yaml`) plus a Settings > 视觉处理模型 entry rendered by the browser half. The dropdown lists the models this deployment has actually configured with image input declared (from `llm.listConfigurableProviders` plus each provider's settings document — the same metadata the paste verdict trusts); when none exist it shows "configure a vision-capable model in Settings > Models first". The choice is synced onto the tool row's `agentOptions` at registration and whenever the setting changes; a saved model that no longer resolves, or that doesn't declare image input, is refused.
+  - **Vision-route settings**: a settings section (`subagent-vision` namespace, persisted in `settings.yaml`) plus a Settings > 视觉处理模型 entry rendered by the browser half. The dropdown lists the models this deployment has actually configured with image input declared (from `llm.listConfigurableProviders` plus each provider's settings document — the same metadata the paste verdict trusts); when none exist it shows "configure a vision-capable model in Settings > Models first". The choice is synced onto the tool row's `agentOptions` at registration and whenever the setting changes — and also persisted into this bundle's own `cordis.patch.yml`, so the tool row starts with the chosen route on the next boot even if the live sync cannot apply it; a saved model that no longer resolves, or that doesn't declare image input, is refused.
   - **Paste-to-path route** (`/subagent-vision/paste`): `GET` answers whether a given `provider`/`model` is positively confirmed text-only (from `inputModalities`, never a name guess); `POST` sniffs image magic bytes (PNG/JPEG/GIF/WebP/HEIC/HEIF), enforces a 25 MB cap, writes a private `0600` temp file, and returns its path.
 - **Browser half** (`client.js`, loaded automatically through the package's `dsh.client` manifest): **intake is left fully native** — pasting or dropping an image shows the composer's own thumbnail rail, native caret behaviour, and native remove/undo. The plugin's only interception is at **send time**: when the draft carries image attachments and the target session's model is positively confirmed text-only (the host's verdict, cached 60 s and re-asked when stale), each draft image is uploaded to the host route (POST /subagent-vision/paste -> private temp path), the draft is released, and the paths are appended to the prompt text before the real send — so the request carries text only and never trips image admission. Image-capable models and unknown models send natively (attachments go through unchanged).
 
@@ -24,13 +24,19 @@ The child is composed like any in-process subagent: its own session, its own too
 ## Requirements
 
 - A dsh installation whose base bundle mounts the subagent capability, tool-fs (`read_image`), attachments, and the Web surface (the stock `web` profile does; the browser half needs the Web GUI).
-- At least one vision-capable model configured through **Settings > Models** (model metadata declaring image input); there is no shipped default model.
+- At least one vision-capable model configured through **Settings > Models** (model metadata declaring image input). The shipped patch pins a baseline route (qwen/qwen3.8-max): if that model isn't configured in your deployment, either configure it, or pick your own model in Settings > 视觉处理模型 (the plugin persists your choice into the patch file), or override the tool row in your profile's `cordis.patch.yml`.
 - The pasted image must fit the route cap (25 MB default); the child's `read_image` applies the deployment's canonical image limits when it reads the file.
 - Runtime dependencies resolved from the profile (`@deepseek-ai/dsh-settings`, `@deepseek-ai/schemastery` host-side; `react` from the client module system).
 
 ## Install
 
 ```sh
+# from GitHub (pnpm shorthand; append #<tag-or-branch> to pin a revision)
+dsh plugin --profile web add github:niuniuaba/dsh-subagent-vision
+
+# from GitHub (explicit git URL)
+dsh plugin --profile web add git+https://github.com/niuniuaba/dsh-subagent-vision.git
+
 # from npm once published
 dsh plugin --profile web add dsh-subagent-vision
 
@@ -50,7 +56,7 @@ The main agent calls `subagent_vision` with the path; the child reads it and ret
 
 ## Configure
 
-**There is no default vision model.** The vision model must first be configured through the built-in **Settings > Models** page (a provider with a model that declares image input, e.g. `qwen3.8-max` with `input: [text, image]`). Then open **Settings > 视觉处理模型** (labeled "请选择视觉处理模型"), pick a model from the dropdown, and save. The choice is written to `settings.yaml` and applied to the `subagent_vision` tool immediately (and on every start). If the dropdown instead shows "没有可用的视觉处理模型，请先在「设置 > 模型」中配置一个支持图片输入的模型", go configure a vision-capable model first, then reload the settings page — the list is re-read live.
+**Baseline route.** The shipped `cordis.patch.yml` pins a baseline vision route — `qwen/qwen3.8-max` — so the tool works immediately on the author's stack. To use your own model: first configure it through the built-in **Settings > Models** page (a provider with a model that declares image input, e.g. `qwen3.8-max` with `input: [text, image]`). Then open **Settings > 视觉处理模型** (labeled "请选择视觉处理模型"), pick a model from the dropdown, and save. The choice is written to `settings.yaml` **and persisted into this bundle's own `cordis.patch.yml`** (the new route applies from the next restart; the live loader sync also tries to apply it immediately). If you never want a baseline, override the `tool-subagent-vision` row in your profile's `cordis.patch.yml` — later patch layers win, replacing the row's config. If the dropdown instead shows "没有可用的视觉处理模型，请先在「设置 > 模型」中配置一个支持图片输入的模型", go configure a vision-capable model first, then reload the settings page — the list is re-read live.
 
 The host plugin is configurable through the `subagent-vision` row's config: `toolName`, `modelHint`, `order`, `visionSettings: false` (turns the settings section and picker off), `pasteToPath: false` (turns the takeover off; the client stands down when the route 404s), `maxBytes`, `verdictTtlMs`.
 
