@@ -1,0 +1,41 @@
+# dsh-subagent-vision bundle patch.
+#
+# Adds `subagent_vision`: a second subagent delegation tool whose children are
+# routed to a vision-capable model. A text-only main agent (DeepSeek) delegates
+# image reading to that child and merges the child's text result back into the
+# same session — no model switching, no second session, no copy-paste.
+#
+# The same package also mounts the host plugin (guide prompt section + vision
+# route settings section + paste-to-path route) and the browser half
+# (client.js), so pasting an image while a text-only model is current stores
+# the bytes as a private temp file and inserts the path into the composer
+# instead of tripping image admission.
+#
+# This file is the durable store for the vision route: when the user picks a
+# model in Settings > 视觉处理模型, the host plugin (index.js) rewrites this
+# row's agentOptions to that choice, so the tool row starts with it on the
+# next boot even if the live settings->agentOptions sync cannot apply it at
+# runtime. Clearing the choice removes the block again. This file is
+# plugin-owned: hand edits to the row survive until the next settings change.
+#
+# The block below is the current baseline: `qwen` is the provider id
+# llm-pi-ai registers for this deployment (`llm.providers` confirms it; the
+# older `pi-ai` id does not resolve here).
+- insert:
+    - id: tool-subagent-vision
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        toolName: subagent_vision
+        provider: spawn
+        backgroundMode: one-shot
+        agentOptions:
+          provider: qwen
+          model: qwen3.8-max
+          maxTokens: 16384
+
+    # Host plugin: guidance section + vision-route settings section +
+    # /subagent-vision/paste route. The same row doubles as the browser-roster
+    # entry because the package declares a `dsh.client` manifest (the client
+    # module system scans loader entries).
+    - id: subagent-vision
+      name: 'dsh-subagent-vision'

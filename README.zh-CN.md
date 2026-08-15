@@ -1,0 +1,85 @@
+# dsh-subagent-vision
+
+[English](README.md) | 中文
+
+一个 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) bundle 插件：让**纯文本**主代理（DeepSeek）在**同一会话内**读图。需要视觉时，主代理指派一个路由到**你在设置里选定的多模态模型**（先在「设置 > 模型」配置，再在「设置 > 视觉处理模型」选择；**不内置默认模型**）的全新子代理，子代理的文本结果再 merge 回当前会话。**粘贴或拖放图片直接可用**：摄入保持完全原生（缩略图栏、删除/撤销照常）；在纯文本会话点击发送时，浏览器半区把每张草稿图片上传成私有临时文件、把路径追加到你的输入文本里，请求不会触发图片准入，纯文本代理即可把路径委派给视觉子代理。不需要切换模型、不需要另开会话、不需要复制粘贴。
+
+## 为什么
+
+DeepSeek 聊天模型不支持图片输入，而 harness 又拒绝把含图的会话切到纯文本模型（即使切了，纯文本 adapter 也会在请求时拒绝图片）。但 harness 本身有完善的子代理能力（`subagent` / `subagent_fork` 工具），子代理可以路由到任意已注册的 provider/model——这个 bundle 只是把一条指向你在设置里选定的视觉路由的第二个委派工具暴露出来，外加发送时的图片转路径转换，让图片以文件路径的形式到达该工具而不触发准入。
+
+## 工作原理
+
+bundle 的 `cordis.patch.yml` 向 profile 组合插入两行：
+
+- **`tool-subagent-vision`** — 第二个 `@deepseek-ai/dsh-tool-subagent` 实例（`toolName: subagent_vision`、`provider: spawn`、`backgroundMode: one-shot`）。本 bundle **不内置任何默认模型**：在用户在设置里选定之前，该行不携带 `agentOptions`。图片块永远不会进入父会话：父代理在工具 prompt 里传**文件路径或 URL**，视觉子代理用自己的 `read_image` 工具读取（该工具的执行闸门检查的是*子代理*的路由模型，它声明支持图片），只有子代理最终的**文本**作为工具结果返回。
+- **`subagent-vision`** — 本包根插件，做三件事：
+  - **引导提示词**：注册一段提示词，告诉模型何时用 `subagent_vision`（自带的 subagent 工具描述里完全没提视觉）。未配置路由时，它会告诉模型*不要*调用该工具、先让用户配置。
+  - **视觉路由设置**：注册 `subagent-vision` 命名空间的设置 section（持久化到 `settings.yaml`），浏览器半区渲染「设置 > 视觉处理模型」入口。下拉框列出本部署**实际配置过且声明支持图片输入**的模型（来自 `llm.listConfigurableProviders` 加各 provider 的 settings 文档——与 paste 裁决信任的是同一份元数据）；没有可用模型时显示"请先在「设置 > 模型」中配置一个支持图片输入的模型"。选择结果在注册时和设置每次变更时同步到工具行的 `agentOptions`；若保存的模型已无法解析、或未声明图片输入，会被拒绝。
+  - **Paste-to-path 路由**（`/subagent-vision/paste`）：`GET` 回答给定 `provider`/`model` 是否被**正向确认**为纯文本（依据 `inputModalities`，绝不靠名字猜测）；`POST` 校验图片 magic bytes（PNG/JPEG/GIF/WebP/HEIC/HEIF）、强制 25 MB 上限、写入私有 `0600` 临时文件并返回路径。
+- **浏览器半区**（`client.js`，通过包的 `dsh.client` 清单自动加载）：在 composer 自身摄入之前运行的 capture 阶段 `paste` 与 `drop` 监听。当当前会话模型被确认为纯文本（host 的裁决，60 秒最大缓存、每次聚焦/文件拖入/粘贴都会重问）时接管摄入：字节送路由、返回的路径以纯文本插入输入框，**并在 composer 上方显示所粘图片的缩略图条**，光标自动落在文本末尾（缩略图下方），可直接继续输入。drop 只在**所有文件都是图片且落在 composer 的 textarea 内**时才接管（其他位置的 drop 保持 composer 原生整页摄入）；接管 drop 时还会补发 composer 监听的 `dragend` 事件，确保拖拽遮罩层正常消失。支持图片的模型和未知模型保持原生摄入。纯文本模型冷启动后的第一次粘贴/拖放可能走一次原生流程，随后自愈。
+
+子代理与普通 in-process 子代理一致：独立会话、独立工具集（继承父代预设组合，含 attachments 挂载时的 `read_image`）、标准委派策略（子代理审批固定为 `never`、sandbox 继承）。子代理内部的图片块只留在子代理自己的日志里。
+
+## 前置条件
+
+- 已安装挂载了子代理能力、tool-fs（`read_image`）、attachments 和 Web 表面的 dsh base bundle（官方 `web` profile 满足；浏览器半区需要 Web GUI）。
+- 在**「设置 > 模型」**中至少配置一个支持图片输入的视觉模型（模型元数据声明 image input）；本插件**不内置默认模型**。
+- 粘贴的图片不能超过路由上限（默认 25 MB）；子代理 `read_image` 读取文件时会套用部署的规范图片限额。
+- 运行时依赖从 profile 解析（宿主侧 `@deepseek-ai/dsh-settings`、`@deepseek-ai/schemastery`；客户端 `react` 来自 client 模块系统）。
+
+## 安装
+
+```sh
+# 发布到 npm 后
+dsh plugin --profile web add dsh-subagent-vision
+
+# 本地目录
+dsh plugin --profile web add /path/to/plugins/dsh-subagent-vision
+```
+
+重启 dsh，用 `dsh plugin --profile web list` 确认。
+
+## 使用
+
+粘贴图片、把图片拖进 composer 的输入框，或给代理一个路径/URL，并说明任务。摄入阶段与原生一致（缩略图栏、删除/撤销）；发送时若会话模型是纯文本，草稿图片会被转成文件路径追加到文本后发出，视觉模型下则原样带图发送。无论哪种，告诉代理你的需求：
+
+> Read the pasted image and summarize what it shows, then continue from there.
+
+主代理调用 `subagent_vision` 并传入路径；子代理读图后返回文本；对话在同一会话继续。
+
+## 配置
+
+**没有默认视觉模型。** 视觉模型必须先在 dsh 内置的**「设置 > 模型」**页配置（配置一个声明支持图片输入的模型，如 `input: [text, image]` 的 `qwen3.8-max`）。然后打开**「设置 > 视觉处理模型」**（下拉框上方有"请选择视觉处理模型"提示），从下拉框选一个模型并保存。选择写入 `settings.yaml`，并立即（以及每次启动时）应用到 `subagent_vision` 工具。如果下拉框显示"没有可用的视觉处理模型，请先在「设置 > 模型」中配置一个支持图片输入的模型"，请先配置视觉模型，再刷新设置页——列表是实时重新枚举的。
+
+host 插件通过 `subagent-vision` 行的 config 配置：`toolName`、`modelHint`、`order`、`visionSettings: false`（关闭设置 section 与选择器）、`pasteToPath: false`（关闭接管；路由 404 时客户端自动停摆）、`maxBytes`、`verdictTtlMs`。
+
+## 验证
+
+在仓库根目录运行：
+
+```sh
+node verify-settings.mjs          # 设置 section、模型枚举、选择器路由、工具行同步
+node browser-verify/driver.mjs    # 浏览器半区（真实 Chrome，见 browser-verify/README.md）
+```
+
+`verify-settings.mjs` 在真实 cordis 上下文 + stub `llm`/`settings`/`loader` 服务下运行 host 插件，断言：`subagent-vision` 设置 section 完成注册、下拉选项恰好是已配置且声明图片输入的模型、注册与设置变更都会同步工具行的 `agentOptions`（保留其余配置）、无法解析或不支持图片的路由会被拒绝、选择器的 HTTP 路由能读取并持久化选择、无模型提示正常渲染。浏览器套件在真实 Chrome 里驱动发货的 `client.js` 对抗真实 paste 路由。
+
+（插件原仓库布局依赖的 `verify.mjs` 断言工具/subagent 接线本身，需要完整的 harness 仓库树才能运行。）
+
+## 限制
+
+- **没有按次调用的模型选择**：子代理路由来自部署配置的 `agentOptions`，不是模型能在任务中改的工具参数（这是 `tool-subagent` 自带 schema 的约束，不是本 bundle 的）。
+- **输入框之外的 drop 保持原生**：浏览器半区接管 composer 内的粘贴和落在 textarea 上的 drop；其他位置的 drop（composer 的整页摄入）仍走缩略图栏，纯文本模型下发送时仍会撞上图片准入。
+- **冷启动首次摄入**：接管需要一份新鲜的 host 裁决，因此纯文本模型冷启动后的第一次粘贴/拖放可能走一次原生流程。
+- **临时文件会累积**：粘贴的图片落在系统临时目录的 `subagent-vision-paste-*` 下，无人删除（交给系统临时清理）。
+- **one-shot 子代理**：结束后子代理会话只读（需要持续与子代理对话时，用自带的 `subagent`/continuable 工具）。
+- **父模型永远看不到图片本身**——只有子代理对它的文本描述。
+
+## 致谢
+
+图片转路径模式（magic-byte 嗅探、私有临时文件、host 侧裁决）参考了 [ModLens](https://github.com/liustack/modlens)（MIT）；本 bundle 的不同之处在于从客户端对象层解析当前模型（而非模型选择器的 DOM label）、在发送时转换而非拦截摄入，以及委派给视觉子代理而非外部视觉引擎。
+
+## License
+
+MIT

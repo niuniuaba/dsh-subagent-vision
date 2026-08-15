@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Local working backups (pre-persist snapshots kept for rollback)
+.rework-backup/
+
+# Manual paste-verification images
+.verify-pasted-image.*
+
+# Browser-verify run artifacts
+browser-verify/last-run.log
+
+# Editor / OS noise
+*.swp
+.DS_Store
+
+# Persist temp files
+*.tmp
