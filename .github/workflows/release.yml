@@ -1,0 +1,43 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # OIDC: lets `npm publish --provenance` authenticate to registry.npmjs.org
+  # without any long-lived token (npm Trusted Publishing). No NODE_AUTH_TOKEN.
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm install --ignore-scripts
+
+      - name: Verify settings wiring
+        run: node verify-settings.mjs
+
+      - name: Tag/version consistency check
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(node -p "require('./package.json').version")"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::tag v${TAG} does not match package.json version ${PKG}" >&2
+            exit 1
+          fi
+
+      - name: Publish to npm (OIDC Trusted Publishing + provenance)
+        run: npm publish --provenance
