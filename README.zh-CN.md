@@ -31,6 +31,9 @@ bundle 的 `cordis.patch.yml` 向 profile 组合插入两行：
 ## 安装
 
 ```sh
+# 从 npm 安装（最快；官方源或国内镜像均可）
+dsh plugin --profile web add dsh-subagent-vision
+
 # 从 GitHub 安装（pnpm 简写；可追加 #<标签或分支> 锁定版本）
 dsh plugin --profile web add github:niuniuaba/dsh-subagent-vision
 

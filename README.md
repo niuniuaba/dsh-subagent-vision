@@ -31,6 +31,9 @@ The child is composed like any in-process subagent: its own session, its own too
 ## Install
 
 ```sh
+# from npm (fastest — works with the official registry or CN mirrors)
+dsh plugin --profile web add dsh-subagent-vision
+
 # from GitHub (pnpm shorthand; append #<tag-or-branch> to pin a revision)
 dsh plugin --profile web add github:niuniuaba/dsh-subagent-vision
 
