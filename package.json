@@ -1,9 +1,17 @@
 {
   "name": "dsh-subagent-vision",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "dsh bundle: subagent_vision — delegate image reading to a vision-capable model from a text-only session, plus paste-to-path so pasted images reach the subagent as file paths.",
   "type": "module",
   "main": "./index.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/niuniuaba/dsh-subagent-vision.git"
+  },
+  "homepage": "https://github.com/niuniuaba/dsh-subagent-vision",
+  "bugs": {
+    "url": "https://github.com/niuniuaba/dsh-subagent-vision/issues"
+  },
   "dependencies": {
     "@deepseek-ai/dsh-settings": "^0.1.0-rc.6",
     "@deepseek-ai/schemastery": "^3.18.1"
