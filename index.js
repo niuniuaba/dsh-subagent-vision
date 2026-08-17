@@ -240,6 +240,51 @@ export function splitVisionRoute(route) {
 }
 
 /**
+ * Walk one configurable-provider directory entry to its `models` array in the
+ * settings document. The models array is where input modalities live: a model
+ * entry declares `input: [text, image]` there, and every consumer (the paste
+ * verdict, the child's read_image gate, this picker) reads that declaration.
+ * @param entry - one `llm.listConfigurableProviders()` entry carrying
+ *   `provider`, `displayName`, `settingsNs`, `settingsPath`.
+ * @param readSettings - `(ns) => document` for the settings service.
+ * @returns `{ models, path, node }` — the models array, the settings path to
+ *   it, and the walked provider node (for schema-capability markers) — or
+ *   `null` when the document does not declare a models array at that path.
+ */
+function providerModels(entry, readSettings) {
+  let node
+  try {
+    node = readSettings(entry.settingsNs)
+  } catch {
+    return null
+  }
+  if (node === undefined || node === null) return null
+  for (const key of entry.settingsPath ?? []) {
+    node = node?.[key]
+    if (node === undefined || node === null) return null
+  }
+  if (!Array.isArray(node?.models)) return null
+  return { models: node.models, path: [...(entry.settingsPath ?? []), 'models'], node }
+}
+
+/**
+ * Whether a provider's settings schema can express model input modalities.
+ * The one-click declare action writes `input: [text, image]` into a model
+ * entry; that is only honest when the provider's settings schema declares the
+ * field. pi-ai's model profile declares `input`, and its provider profile
+ * always materializes a `defaultInput` array — a marker no other installed
+ * adapter's settings schema produces (DeepSeek's catalog schema has no
+ * modality field at all, so a declaration there would be stored but never
+ * read by the adapter). Presence of `defaultInput` on the walked provider
+ * node is the conservative "this schema expresses input" signal.
+ * @param node - the provider node `providerModels` walked to.
+ * @returns whether model entries there can carry an `input` declaration.
+ */
+function canExpressInput(node) {
+  return Array.isArray(node?.defaultInput)
+}
+
+/**
  * Enumerate the vision-capable models a deployment has actually configured.
  * @param providers - `llm.listConfigurableProviders()` output: each entry
  *   carries `provider`, `displayName`, `settingsNs`, `settingsPath`.
@@ -251,19 +296,9 @@ export function enumerateVisionRoutes(providers, readSettings) {
   const seen = new Set()
   const routes = []
   for (const entry of providers) {
-    let node
-    try {
-      node = readSettings(entry.settingsNs)
-    } catch {
-      continue
-    }
-    if (node === undefined || node === null) continue
-    for (const key of entry.settingsPath ?? []) {
-      node = node?.[key]
-      if (node === undefined || node === null) break
-    }
-    const models = Array.isArray(node?.models) ? node.models : []
-    for (const model of models) {
+    const found = providerModels(entry, readSettings)
+    if (found === null) continue
+    for (const model of found.models) {
       if (typeof model?.id !== 'string' || model.id === '') continue
       if (!Array.isArray(model.input) || !model.input.includes('image')) continue
       const value = `${entry.provider}/${model.id}`
@@ -276,6 +311,123 @@ export function enumerateVisionRoutes(providers, readSettings) {
     }
   }
   return routes
+}
+
+/**
+ * Enumerate configured models that do NOT declare image input — the models
+ * the picker can offer to declare image-capable with one click. The Settings >
+ * Models surface cannot express input modalities, so a model configured there
+ * arrives without a declaration and is treated as text-only by every consumer;
+ * this is the list that makes that state visible and fixable in-GUI.
+ * @param providers - `llm.listConfigurableProviders()` output.
+ * @param readSettings - `(ns) => document` for the settings service.
+ * @returns `{ provider, displayName, model, modelName }` candidates,
+ *   deduplicated, in provider order; image-declaring models excluded.
+ */
+export function enumerateUndecidedModels(providers, readSettings) {
+  const seen = new Set()
+  const undecided = []
+  for (const entry of providers) {
+    const found = providerModels(entry, readSettings)
+    if (found === null) continue
+    // Only offer the declare action where the settings schema can actually
+    // carry the declaration (see canExpressInput); a model under a schema
+    // without modality fields can never be declared image-capable.
+    if (!canExpressInput(found.node)) continue
+    for (const model of found.models) {
+      if (typeof model?.id !== 'string' || model.id === '') continue
+      if (Array.isArray(model.input) && model.input.includes('image')) continue
+      const value = `${entry.provider}/${model.id}`
+      if (seen.has(value)) continue
+      seen.add(value)
+      undecided.push({
+        provider: entry.provider,
+        displayName: entry.displayName,
+        model: model.id,
+        modelName: typeof model.name === 'string' && model.name !== '' ? model.name : model.id,
+      })
+    }
+  }
+  return undecided
+}
+
+/**
+ * The hint the picker shows. With no selectable route it names the configured
+ * models that could be declared image-capable instead of only pointing at
+ * Settings > Models (where the GUI cannot express input modalities).
+ * @param options - current selectable routes.
+ * @param undecided - configured models without a declared image input.
+ * @returns the hint text.
+ */
+function routeHint(options, undecided) {
+  if (options.length > 0) return '选择用于 subagent_vision 委派读图的视觉模型（来自「设置 > 模型」中已配置的模型）。'
+  if (undecided.length === 0) return NO_ROUTE_HINT
+  const names = undecided.map((u) => `${u.provider}/${u.model}`).join('、')
+  return `已配置的模型未声明图片输入：${names}。请为该模型的 settings.yaml 条目添加 input: [text, image]，或点击下方「声明支持图片输入」。`
+}
+
+/**
+ * Read one provider entry's node from the RAW stored settings section, when
+ * the settings service exposes it. A declare must rewrite the models array
+ * from what is actually stored — the resolved document materializes schema
+ * fields (`compat: {}`, `input: []`, …) that a write would otherwise leak
+ * into `settings.yaml`. Falls back to `undefined` so the caller can use the
+ * resolved document instead.
+ * @param sctx - scoped context carrying the settings service.
+ * @param entry - one `llm.listConfigurableProviders()` entry.
+ * @returns the walked raw provider node, or `undefined` when unavailable.
+ */
+function rawProviderNode(sctx, entry) {
+  let node
+  try {
+    node = sctx.settings.section?.(entry.settingsNs)
+  } catch {
+    return undefined
+  }
+  if (node === undefined || node === null) return undefined
+  for (const key of entry.settingsPath ?? []) {
+    node = node?.[key]
+    if (node === undefined || node === null) return undefined
+  }
+  return Array.isArray(node?.models) ? node : undefined
+}
+
+/**
+ * Declare image input on one configured model by writing `input: [text, image]`
+ * into its entry in the provider's settings document — the same metadata the
+ * paste verdict and the child's read_image gate trust, so the declaration
+ * makes the model image-capable end to end. The user's explicit click is the
+ * declaration; nothing is ever guessed from the model name.
+ * @param sctx - scoped context carrying the settings service.
+ * @param ctx - plugin context carrying the llm service.
+ * @param provider - the configurable-provider id.
+ * @param model - the model id within that provider's settings document.
+ */
+async function declareImageInput(sctx, ctx, provider, model) {
+  const entries = ctx.llm.listConfigurableProviders?.() ?? []
+  const entry = entries.find((e) => e.provider === provider)
+  if (entry === undefined) throw new Error(`unknown provider ${JSON.stringify(provider)}`)
+  // Capability check on the RESOLVED node (pi-ai materializes the
+  // `defaultInput` marker only during schema resolution).
+  const resolved = providerModels(entry, (ns) => sctx.settings.get(ns))
+  if (resolved === null) throw new Error(`provider ${JSON.stringify(provider)} has no settings document with a models list`)
+  // Refuse BEFORE any write when the settings schema cannot express the
+  // declaration: a stored-but-ignored `input` would fool this picker's own
+  // enumeration while the adapter still refuses images at request time.
+  if (!canExpressInput(resolved.node)) {
+    throw new Error(`provider ${JSON.stringify(provider)} cannot declare image input: its settings schema does not support model input modalities`)
+  }
+  // Rewrite the RAW models array so only stored fields plus the new `input`
+  // land in the document (the resolved entry carries schema-materialized
+  // noise such as `compat: {}` that must not be persisted).
+  const raw = rawProviderNode(sctx, entry) ?? resolved
+  const target = raw.models.find((m) => m?.id === model)
+  if (target === undefined) throw new Error(`model ${JSON.stringify(model)} is not listed under provider ${JSON.stringify(provider)}`)
+  if (Array.isArray(target.input) && target.input.includes('image')) {
+    throw new Error(`${provider}/${model} already declares image input`)
+  }
+  const next = raw.models.map((m) => (m?.id === model ? { ...m, input: ['text', 'image'] } : m))
+  await sctx.settings.mutate(entry.settingsNs, [{ op: 'set', path: resolved.path, value: next }])
 }
 
 /** Leading-whitespace width of one line. */
@@ -424,8 +576,9 @@ function registerVisionRouteSettings(ctx, config) {
   if (typeof ctx.inject !== 'function') return
   ctx.inject(['settings', 'llm'], (sctx) => {
     let source = () => undefined
-    const enumerateNow = () =>
-      enumerateVisionRoutes(sctx.llm.listConfigurableProviders?.() ?? [], (ns) => sctx.settings.get(ns))
+    const readSettings = (ns) => sctx.settings.get(ns)
+    const enumerateNow = () => enumerateVisionRoutes(sctx.llm.listConfigurableProviders?.() ?? [], readSettings)
+    const undecidedNow = () => enumerateUndecidedModels(sctx.llm.listConfigurableProviders?.() ?? [], readSettings)
     try {
       const options = enumerateNow().map((r) => ({ value: r.value, label: r.label }))
       const current = currentToolRoute(ctx)
@@ -435,7 +588,7 @@ function registerVisionRouteSettings(ctx, config) {
       const schema = z.object({
         [ROUTE_FIELD]:
           options.length === 0
-            ? field.default('').description(NO_ROUTE_HINT)
+            ? field.default('').description(routeHint(options, undecidedNow()))
             : field.required().description('选择用于 subagent_vision 委派读图的视觉模型（来自「设置 > 模型」中已配置的模型）。'),
       })
       const entry = { [ROUTE_FIELD]: initial }
@@ -478,14 +631,19 @@ function registerVisionRouteSettings(ctx, config) {
         registerVisionRouteHttp(scope, ctx, {
           read: () => {
             const options = enumerateNow().map((r) => ({ value: r.value, label: r.label }))
+            const undecided = undecidedNow()
             return {
               options,
-              hint: options.length === 0 ? NO_ROUTE_HINT : '选择用于 subagent_vision 委派读图的视觉模型（来自「设置 > 模型」中已配置的模型）。',
+              undecided,
+              hint: routeHint(options, undecided),
               current: source?.()?.[ROUTE_FIELD] ?? '',
             }
           },
           write: async (route) => {
             await sctx.settings.replace(SETTINGS_NS, { [ROUTE_FIELD]: route })
+          },
+          declare: async (provider, model) => {
+            await declareImageInput(sctx, ctx, provider, model)
           },
         })
       } catch (error) {
@@ -497,11 +655,14 @@ function registerVisionRouteSettings(ctx, config) {
 
 /**
  * Register the picker's HTTP surface:
- *   GET  /subagent-vision/settings -> { options, hint, current }
- *   POST /subagent-vision/settings -> { visionRoute } -> stored
+ *   GET  /subagent-vision/settings -> { options, undecided, hint, current }
+ *   POST /subagent-vision/settings -> { visionRoute }            -> stored
+ *   POST /subagent-vision/settings -> { action: 'declareImage', provider, model }
+ *                                                                -> image input declared
  * @param scope - scoped context carrying the webServer service.
  * @param ctx - plugin context.
- * @param io - `read()` snapshot and `write(route)` persistence callback.
+ * @param io - `read()` snapshot, `write(route)` persistence, and
+ *   `declare(provider, model)` one-click image-input declaration callbacks.
  */
 function registerVisionRouteHttp(scope, ctx, io) {
   scope.webServer.register({
@@ -510,9 +671,9 @@ function registerVisionRouteHttp(scope, ctx, io) {
     path: '/subagent-vision/settings',
     handler: async (req, res) => {
       if (req.method === 'GET') {
-        const { options, hint, current } = io.read()
+        const { options, undecided, hint, current } = io.read()
         res.writeHead(200, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ options, hint, current }))
+        res.end(JSON.stringify({ options, undecided, hint, current }))
         return
       }
       if (req.method !== 'POST') {
@@ -523,6 +684,19 @@ function registerVisionRouteHttp(scope, ctx, io) {
         let body = ''
         for await (const chunk of req) body += chunk
         const parsed = body === '' ? {} : JSON.parse(body)
+        if (parsed.action === 'declareImage') {
+          // One-click "this model accepts images": write `input: [text, image]`
+          // into the model's entry in the provider settings document, then
+          // re-serve the fresh options so the client can show the route.
+          if (typeof parsed.provider !== 'string' || parsed.provider === '' || typeof parsed.model !== 'string' || parsed.model === '') {
+            throw new Error('declareImage needs provider and model')
+          }
+          await io.declare(parsed.provider, parsed.model)
+          const { options } = io.read()
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: true, options }))
+          return
+        }
         const route = parsed.visionRoute
         if (typeof route !== 'string') throw new Error('visionRoute must be a string')
         const { options } = io.read()

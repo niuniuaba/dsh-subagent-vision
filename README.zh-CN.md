@@ -15,7 +15,7 @@ bundle 的 `cordis.patch.yml` 向 profile 组合插入两行：
 - **`tool-subagent-vision`** — 第二个 `@deepseek-ai/dsh-tool-subagent` 实例（`toolName: subagent_vision`、`provider: spawn`、`backgroundMode: one-shot`）。该行以发布版 `cordis.patch.yml` 中的**出厂默认 `agentOptions`**（qwen/qwen3.8-max）启动，保证开箱即用；在「设置 > 视觉处理模型」里改选模型会把该选择**写回这个 patch 文件**（新路由下次重启生效，实时 loader 同步成功时也会立即生效）；出问题时可直接编辑该文件的 `agentOptions` 字段。图片块永远不会进入父会话：父代理在工具 prompt 里传**文件路径或 URL**，视觉子代理用自己的 `read_image` 工具读取（该工具的执行闸门检查的是*子代理*的路由模型，它声明支持图片），只有子代理最终的**文本**作为工具结果返回。
 - **`subagent-vision`** — 本包根插件，做三件事：
   - **引导提示词**：注册一段提示词，告诉模型何时用 `subagent_vision`（自带的 subagent 工具描述里完全没提视觉）。未配置路由时，它会告诉模型*不要*调用该工具、先让用户配置。
-  - **视觉路由设置**：注册 `subagent-vision` 命名空间的设置 section（持久化到 `settings.yaml`），浏览器半区渲染「设置 > 视觉处理模型」入口。下拉框列出本部署**实际配置过且声明支持图片输入**的模型（来自 `llm.listConfigurableProviders` 加各 provider 的 settings 文档——与 paste 裁决信任的是同一份元数据）；没有可用模型时显示"请先在「设置 > 模型」中配置一个支持图片输入的模型"。选择结果在注册时和设置每次变更时同步到工具行的 `agentOptions`，**并持久化进本 bundle 自己的 `cordis.patch.yml`**——即使实时同步失效，工具行也会在下次启动时带着所选路由；若保存的模型已无法解析、或未声明图片输入，会被拒绝。
+  - **视觉路由设置**：注册 `subagent-vision` 命名空间的设置 section（持久化到 `settings.yaml`），浏览器半区渲染「设置 > 视觉处理模型」入口。下拉框列出本部署**实际配置过且声明支持图片输入**的模型（来自 `llm.listConfigurableProviders` 加各 provider 的 settings 文档——与 paste 裁决信任的是同一份元数据）；没有可用模型时，提示会**点名已配置但未声明图片输入的模型**，并为每个模型提供一键**「声明支持图片输入」**按钮（把 `input: [text, image]` 写进该模型在 provider settings 文档里的条目，如 `settings.yaml`——「设置 > 模型」界面本身无法表达输入模态，所以在那里配置的模型默认按纯文本处理，直到显式声明）。选择结果在注册时和设置每次变更时同步到工具行的 `agentOptions`，**并持久化进本 bundle 自己的 `cordis.patch.yml`**——即使实时同步失效，工具行也会在下次启动时带着所选路由；若保存的模型已无法解析、或未声明图片输入，会被拒绝。
   - **Paste-to-path 路由**（`/subagent-vision/paste`）：`GET` 回答给定 `provider`/`model` 是否被**正向确认**为纯文本（依据 `inputModalities`，绝不靠名字猜测）；`POST` 校验图片 magic bytes（PNG/JPEG/GIF/WebP/HEIC/HEIF）、强制 25 MB 上限、写入私有 `0600` 临时文件并返回路径。
 - **浏览器半区**（`client.js`，通过包的 `dsh.client` 清单自动加载）：**摄入保持完全原生**——粘贴或拖放图片走 composer 自己的缩略图栏、原生光标行为与删除/撤销。插件的唯一拦截点在**发送时**：当草稿携带图片附件且目标会话模型被**正向确认**为纯文本（host 裁决，基于 `inputModalities`，60 秒缓存、过期重问）时，把每张草稿图片上传到宿主路由（POST /subagent-vision/paste → 私有临时路径）、释放草稿，并把路径追加到提示文本后再真正发送——请求只带文本，永不触发图片准入。支持图片的模型与未知模型原样带图发送。
 
@@ -61,6 +61,18 @@ dsh plugin --profile web add /path/to/plugins/dsh-subagent-vision
 1. 先在 dsh 内置的**「设置 > 模型」**页配置一个声明支持图片输入的模型（如 `input: [text, image]` 的 `qwen3.8-max`）。
 2. 打开**「设置 > 视觉处理模型」**（下拉框上方有"请选择视觉处理模型"提示），从下拉框选一个模型并保存。选择写入 `settings.yaml`，**并持久化进本 bundle 自己的 `cordis.patch.yml`**（新路由下次重启生效；实时 loader 同步成功时也会立即生效）。
 
+「设置 > 模型」界面无法表达输入模态：在那里配置的模型条目**不会带 `input` 声明**，因此 harness 会把它当作**纯文本**处理，直到你显式声明。若选择器把你的模型列在「声明支持图片输入」下，点击该按钮即可（它会向该模型的 `settings.yaml` 条目写入 `input: [text, image]`）；也可以手动添加：
+
+```yaml
+llm-pi-ai:
+  providers:
+    qwen:
+      models:
+        - id: qwen3.8-max
+          name: qwen3.8-max
+          input: [text, image]
+```
+
 如果遇到问题，可以直接修改插件 patch 文件中的 `agentOptions` 字段：
 
 ```text
@@ -74,7 +86,7 @@ agentOptions:
   maxTokens: 16384
 ```
 
-（在自己 profile 的 `cordis.patch.yml` 中加同 id 的行也可以覆盖本行——后层 patch 生效。）如果下拉框显示"没有可用的视觉处理模型，请先在「设置 > 模型」中配置一个支持图片输入的模型"，请先配置视觉模型，再刷新设置页——列表是实时重新枚举的。
+（在自己 profile 的 `cordis.patch.yml` 中加同 id 的行也可以覆盖本行——后层 patch 生效。）如果下拉框显示的是点名你已配置模型的提示（并带「声明支持图片输入」按钮），点击该按钮（或在 `settings.yaml` 为该模型条目加 `input: [text, image]`），然后刷新设置页——列表是实时重新枚举的。
 
 host 插件通过 `subagent-vision` 行的 config 配置：`toolName`、`modelHint`、`order`、`visionSettings: false`（关闭设置 section 与选择器）、`pasteToPath: false`（关闭接管；路由 404 时客户端自动停摆）、`maxBytes`、`verdictTtlMs`。
 
@@ -84,10 +96,13 @@ host 插件通过 `subagent-vision` 行的 config 配置：`toolName`、`modelHi
 
 ```sh
 node verify-settings.mjs          # 设置 section、模型枚举、选择器路由、工具行同步
+node verify-live.mjs              # 真实实例：点名提示 + 一键声明（见下）
 node browser-verify/driver.mjs    # 浏览器半区（真实 Chrome，见 browser-verify/README.md）
 ```
 
-`verify-settings.mjs` 在真实 cordis 上下文 + stub `llm`/`settings`/`loader` 服务下运行 host 插件，断言：`subagent-vision` 设置 section 完成注册、下拉选项恰好是已配置且声明图片输入的模型、注册与设置变更都会同步工具行的 `agentOptions`（保留其余配置）、无法解析或不支持图片的路由会被拒绝、选择器的 HTTP 路由能读取并持久化选择、无模型提示正常渲染。浏览器套件在真实 Chrome 里驱动发货的 `client.js` 对抗真实 paste 路由。
+`verify-live.mjs` 直接驱动**正在运行的** dsh web 实例（经 `/subagent-vision/settings`）：在待测模型暂时未声明图片输入（选项为空）的前提下，断言提示点名了已配置但未声明的模型、POST `declareImage` 动作、并断言模型重新可选——声明动作本身就还原了配置。用法：`node verify-live.mjs [baseURL] [provider] [model]`（默认 `http://127.0.0.1:3080 qwen qwen3.8-max`）。
+
+`verify-settings.mjs` 在真实 cordis 上下文 + stub `llm`/`settings`/`loader` 服务下运行 host 插件，断言：`subagent-vision` 设置 section 完成注册、下拉选项恰好是已配置且声明图片输入的模型、注册与设置变更都会同步工具行的 `agentOptions`（保留其余配置）、无法解析或不支持图片的路由会被拒绝、选择器的 HTTP 路由能读取并持久化选择、未声明图片输入的已配置模型会被点名且支持一键声明、无模型提示正常渲染。浏览器套件在真实 Chrome 里驱动发货的 `client.js` 对抗真实 paste 路由。
 
 （插件原仓库布局依赖的 `verify.mjs` 断言工具/subagent 接线本身，需要完整的 harness 仓库树才能运行。）
 

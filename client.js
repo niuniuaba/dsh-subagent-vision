@@ -125,33 +125,36 @@ window.__ModuleLoader__.load({
     // A self-contained settings.section: the dropdown lists the models the
     // host enumerated (live re-read through the plugin route), the current
     // value comes from the namespace document, and saving issues a settings
-    // mutate. When the host has no options it shows the hint it put on the
-    // field — "configure a vision model in Settings > Models first". No build
-    // step: hand-written React via createElement.
+    // mutate. When the host has no selectable options it shows the hint it put
+    // on the field — "configure a vision model in Settings > Models first" —
+    // and, when configured models exist but none declares image input (the
+    // Models surface cannot express input modalities), lists them with a
+    // one-click "declare image input" button that writes `input: [text, image]`
+    // into that model's settings entry. No build step: hand-written React via
+    // createElement.
     function VisionRouteSection() {
       var h = React.createElement
       var useState = React.useState
       var useEffect = React.useEffect
-      var [state, setState] = useState({ status: 'loading', options: [], current: '', hint: '' })
-      useEffect(() => {
-        var alive = true
-        fetch('/subagent-vision/settings')
+      var [state, setState] = useState({ status: 'loading', options: [], undecided: [], current: '', hint: '' })
+      function load() {
+        return fetch('/subagent-vision/settings')
           .then((res) => res.json())
           .then((data) => {
-            if (!alive) return
             setState({
               status: 'ready',
               options: Array.isArray(data.options) ? data.options : [],
+              undecided: Array.isArray(data.undecided) ? data.undecided : [],
               current: typeof data.current === 'string' ? data.current : '',
               hint: typeof data.hint === 'string' ? data.hint : '',
             })
           })
           .catch((error) => {
-            if (alive) setState({ status: 'error', options: [], current: '', hint: String(error?.message ?? error) })
+            setState({ status: 'error', options: [], undecided: [], current: '', hint: String(error?.message ?? error) })
           })
-        return () => {
-          alive = false
-        }
+      }
+      useEffect(() => {
+        load()
       }, [])
       function onSelect(event) {
         var value = event.target.value
@@ -168,8 +171,55 @@ window.__ModuleLoader__.load({
             /* keep the previous value on failure */
           })
       }
+      function declareImage(provider, model) {
+        fetch('/subagent-vision/settings', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ action: 'declareImage', provider, model }),
+        })
+          .then((res) => {
+            // 404: the running host predates the declare route (plugin not
+            // restarted). Fall back to the manual hint instead of a dead button.
+            if (res.status === 404) {
+              setState((s) =>
+                Object.assign({}, s, {
+                  status: 'error',
+                  hint: '「声明支持图片输入」需要重启 dsh 生效（宿主路由尚未加载）。也可直接编辑 settings.yaml：在该模型的 models 条目中添加 input: [text, image]。',
+                }),
+              )
+              return null
+            }
+            return res.json()
+          })
+          .then((data) => {
+            if (data && data.ok === true) {
+              // The model now declares image input: refresh the list so the
+              // dropdown appears with it selectable.
+              load()
+            }
+          })
+          .catch(() => {
+            /* keep the previous state on failure */
+          })
+      }
       var style = { width: '100%', minHeight: '34px', boxSizing: 'border-box' }
       var labelStyle = { margin: '0 0 6px', fontSize: '13px', fontWeight: 500, color: 'var(--dsw-alias-label-primary, #222)' }
+      var hintStyle = { margin: '4px 0 8px', color: 'var(--dsw-alias-label-tertiary, #888)' }
+      var rowStyle = { display: 'flex', alignItems: 'center', gap: '8px', margin: '6px 0', fontSize: '13px' }
+      var nameStyle = { flex: '1', minWidth: '0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
+      var buttonStyle = {
+        boxSizing: 'border-box',
+        height: '28px',
+        border: 'none',
+        borderRadius: '14px',
+        cursor: 'pointer',
+        padding: '0 12px',
+        fontSize: '12px',
+        lineHeight: '28px',
+        background: 'var(--dsw-alias-button-primary-fill, #2563eb)',
+        color: 'var(--dsw-alias-label-primary-foreground, #fff)',
+        flex: 'none',
+      }
       var body
       if (state.status === 'ready' && state.options.length > 0) {
         body = h(
@@ -183,10 +233,42 @@ window.__ModuleLoader__.load({
             state.options.map((option) => h('option', { key: option.value, value: option.value }, option.label)),
           ),
         )
+      } else if (state.status === 'ready' && state.undecided.length > 0) {
+        body = h(
+          'div',
+          { key: 'undecided' },
+          h('p', { key: 'hint', style: hintStyle, 'data-testid': 'vision-route-hint' }, state.hint),
+          h(
+            'ul',
+            { key: 'list', style: { listStyle: 'none', margin: '0', padding: '0' } },
+            state.undecided.map((entry) =>
+              h(
+                'li',
+                { key: `${entry.provider}/${entry.model}`, style: rowStyle },
+                h(
+                  'span',
+                  { key: 'name', style: nameStyle },
+                  `${entry.displayName || entry.provider}: ${entry.modelName || entry.model}`,
+                ),
+                h(
+                  'button',
+                  {
+                    key: 'declare',
+                    type: 'button',
+                    style: buttonStyle,
+                    'data-testid': `vision-route-declare-${entry.provider}-${entry.model}`,
+                    onClick: () => declareImage(entry.provider, entry.model),
+                  },
+                  '声明支持图片输入',
+                ),
+              ),
+            ),
+          ),
+        )
       } else if (state.status === 'ready') {
-        body = h('p', { key: 'hint', style: { margin: '4px 0', color: 'var(--dsw-alias-label-tertiary, #888)' } }, state.hint || '…')
+        body = h('p', { key: 'hint', style: hintStyle }, state.hint || '…')
       } else if (state.status === 'loading') {
-        body = h('p', { key: 'loading', style: { margin: '4px 0', color: 'var(--dsw-alias-label-tertiary, #888)' } }, '…')
+        body = h('p', { key: 'loading', style: hintStyle }, '…')
       } else {
         body = h('p', { key: 'error', style: { margin: '4px 0', color: 'var(--dsw-alias-state-error-primary, #c0392b)' } }, state.hint)
       }

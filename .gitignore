@@ -10,6 +10,10 @@ node_modules/
 # Browser-verify run artifacts
 browser-verify/last-run.log
 
+# Local analysis material (competitor clones + comparison report)
+.compare/
+VISION-COMPARISON-REPORT.md
+
 # Editor / OS noise
 *.swp
 .DS_Store

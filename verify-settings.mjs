@@ -58,24 +58,30 @@ function fakeReq(method, url, chunks) {
 }
 
 const stubSettings = {
+  // get() serves the RESOLVED view (schema-materialized: `defaultInput` on the
+  // provider node, `compat: {}` on model entries) — what the plugin's
+  // enumeration and capability check read.
   get(ns) {
-    if (ns === 'llm-pi-ai') {
-      return {
-        providers: {
-          qwen: {
-            models: [
-              { id: 'qwen3.8-max', name: 'qwen3.8-max', input: ['text', 'image'] },
-              { id: 'qwen-flash', name: 'qwen-flash', input: ['text'] },
-            ],
-          },
-        },
-      }
-    }
+    if (ns === 'llm-pi-ai') return resolvedPiAi(piAiDoc)
     if (ns === 'llm-anthropic') {
       return {
         models: [{ id: 'claude-3.7', name: 'Claude 3.7', input: ['text', 'image'] }],
       }
     }
+    if (ns === 'llm-deepseek') return deepSeekDoc
+    return undefined
+  },
+  // section() serves the RAW stored view (exactly what settings.yaml holds) —
+  // what the declare route rewrites, so schema-materialized fields never leak
+  // into storage.
+  section(ns) {
+    if (ns === 'llm-pi-ai') return piAiDoc
+    if (ns === 'llm-anthropic') {
+      return {
+        models: [{ id: 'claude-3.7', name: 'Claude 3.7', input: ['text', 'image'] }],
+      }
+    }
+    if (ns === 'llm-deepseek') return deepSeekDoc
     return undefined
   },
   register(ns, schema, opts) {
@@ -90,12 +96,71 @@ const stubSettings = {
     userValue = section
     for (const fn of watchers) fn()
   },
+  mutate(ns, ops) {
+    applyStubOps(ns === 'llm-deepseek' ? deepSeekDoc : piAiDoc, ops)
+  },
+}
+
+/**
+ * The resolved pi-ai view derived from the raw stored document: schema
+ * resolution materializes `defaultInput: ['text']` on the provider profile
+ * and `compat: {}` on every model entry — the exact shape the real pi-ai
+ * schema produces (verified against `Config(...)`).
+ */
+function resolvedPiAi(raw) {
+  return {
+    providers: {
+      qwen: {
+        defaultInput: ['text'],
+        models: (raw.providers?.qwen?.models ?? []).map((model) => ({ ...model, compat: {} })),
+      },
+    },
+  }
+}
+
+/**
+ * The RAW pi-ai settings document the stub stores and serves through
+ * `section()`. Mutable so the declare route's write can be observed:
+ * `mutate` applies path ops onto it and `get()` re-derives the resolved view.
+ */
+const piAiDoc = {
+  providers: {
+    qwen: {
+      models: [
+        { id: 'qwen3.8-max', name: 'qwen3.8-max', input: ['text', 'image'] },
+        { id: 'qwen-flash', name: 'qwen-flash', input: ['text'] },
+      ],
+    },
+  },
+}
+
+/**
+ * A settings schema that cannot express model input (DeepSeek-style): no
+ * `defaultInput` on the provider node, and model entries carry no modality
+ * field. Such models must never be offered the one-click declare action.
+ */
+const deepSeekDoc = {
+  models: [{ id: 'deepseek-v4-flash', name: 'DeepSeek-V4-Flash' }],
+}
+
+/** Minimal path-op application for the stub (plain-object steps only). */
+function applyStubOps(doc, ops) {
+  for (const op of ops) {
+    const parts = op.path
+    let node = doc
+    for (let i = 0; i < parts.length - 1; i++) node = node[parts[i]]
+    const head = parts[parts.length - 1]
+    if (op.op === 'unset') delete node[head]
+    else node[head] = op.value
+  }
+  return doc
 }
 
 const stubLlm = {
   listConfigurableProviders: () => [
     { provider: 'pi-ai', displayName: 'Qwen (DashScope)', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'qwen'] },
     { provider: 'anthropic', displayName: 'Anthropic', settingsNs: 'llm-anthropic', settingsPath: [] },
+    { provider: 'deepseek-official', displayName: 'DeepSeek', settingsNs: 'llm-deepseek', settingsPath: [] },
   ],
   resolveModelInfo: async (provider, model) => resolveImpl(provider, model),
 }
@@ -226,7 +291,7 @@ ctxEmpty.provide('llm', {
 })
 ctxEmpty.provide('settings', {
   get() {
-    return { providers: { qwen: { models: [{ id: 'qwen-flash', name: 'qwen-flash', input: ['text'] }] } } }
+    return { providers: { qwen: { defaultInput: ['text'], models: [{ id: 'qwen-flash', name: 'qwen-flash', input: ['text'] }] } } }
   },
   register(ns, schema, opts) {
     registrationsEmpty.push({ ns, schema, base: opts.base })
@@ -245,8 +310,8 @@ const emptyJson = JSON.stringify(regEmpty?.schema.toJSON())
 check('no-model section still registers', regEmpty !== undefined)
 check('no-model section entry is empty (no default)', regEmpty?.base.visionRoute === '')
 check(
-  'no-model section carries the configure-in-Models hint',
-  emptyJson.includes('没有可用的视觉处理模型'),
+  'no-model section carries an actionable hint naming the configured model',
+  emptyJson.includes('qwen-flash') && !emptyJson.includes('没有可用的视觉处理模型'),
 )
 check('no-model section does not sync the tool row', updatesEmpty.length === 0)
 check('guide prompt with no route tells the model not to call the tool', sectionsEmpty[0].text().includes('not configured yet'))
@@ -280,6 +345,131 @@ if (settingsRoute) {
   const putRes = fakeRes()
   await settingsRoute.handler(fakeReq('PUT', '/subagent-vision/settings'), putRes)
   check('non-GET/POST method is refused', putRes.state.status === 405)
+}
+
+// 11: configured models without a declared image input are surfaced and can be
+// declared image-capable with one click (the Settings > Models surface cannot
+// express input modalities, so this is the in-GUI way to fix the empty picker).
+const settingsRoute2 = httpRoutes.find((r) => r.path === '/subagent-vision/settings')
+check('picker HTTP route registered for declare', settingsRoute2 !== undefined)
+if (settingsRoute2) {
+  const providersNow = () => stubLlm.listConfigurableProviders()
+  check(
+    'enumerateUndecidedModels lists configured models without image input',
+    host
+      .enumerateUndecidedModels(providersNow(), (ns) => stubSettings.get(ns))
+      .some((u) => u.provider === 'pi-ai' && u.model === 'qwen-flash'),
+    JSON.stringify(host.enumerateUndecidedModels(providersNow(), (ns) => stubSettings.get(ns))),
+  )
+  check(
+    'enumerateUndecidedModels excludes image-declaring models',
+    !host
+      .enumerateUndecidedModels(providersNow(), (ns) => stubSettings.get(ns))
+      .some((u) => u.model === 'qwen3.8-max' || u.model === 'claude-3.7'),
+  )
+  check(
+    'enumerateUndecidedModels excludes schemas that cannot express input',
+    !host
+      .enumerateUndecidedModels(providersNow(), (ns) => stubSettings.get(ns))
+      .some((u) => u.provider === 'deepseek-official'),
+    JSON.stringify(host.enumerateUndecidedModels(providersNow(), (ns) => stubSettings.get(ns))),
+  )
+
+  let res = fakeRes()
+  await settingsRoute2.handler(fakeReq('GET', '/subagent-vision/settings'), res)
+  let got = JSON.parse(res.state.body)
+  check(
+    'GET surfaces undecided models',
+    Array.isArray(got.undecided) && got.undecided.some((u) => u.provider === 'pi-ai' && u.model === 'qwen-flash'),
+    JSON.stringify(got.undecided),
+  )
+  check('hint served alongside undecided', typeof got.hint === 'string' && got.hint.length > 0, got.hint)
+
+  res = fakeRes()
+  await settingsRoute2.handler(
+    fakeReq('POST', '/subagent-vision/settings', [Buffer.from(JSON.stringify({ action: 'declareImage', provider: 'pi-ai', model: 'qwen-flash' }))]),
+    res,
+  )
+  check('declareImage POST ok', res.state.status === 200 && JSON.parse(res.state.body).ok === true)
+  check(
+    'declareImage wrote input into the provider settings document',
+    Array.isArray(piAiDoc.providers.qwen.models[1]?.input) && piAiDoc.providers.qwen.models[1].input.includes('image'),
+    JSON.stringify(piAiDoc.providers.qwen.models[1]),
+  )
+  check(
+    'declareImage does not leak schema-materialized fields into storage',
+    !('compat' in piAiDoc.providers.qwen.models[1]),
+    JSON.stringify(piAiDoc.providers.qwen.models[1]),
+  )
+
+  res = fakeRes()
+  await settingsRoute2.handler(fakeReq('GET', '/subagent-vision/settings'), res)
+  got = JSON.parse(res.state.body)
+  check(
+    'declared model now listed as a selectable option',
+    got.options.some((o) => o.value === 'pi-ai/qwen-flash'),
+    JSON.stringify(got.options),
+  )
+  check('declared model no longer undecided', !got.undecided.some((u) => u.model === 'qwen-flash'))
+
+  res = fakeRes()
+  await settingsRoute2.handler(fakeReq('POST', '/subagent-vision/settings', [Buffer.from(JSON.stringify({ action: 'declareImage', provider: 'pi-ai', model: 'nope' }))]), res)
+  check('declareImage unknown model refused', res.state.status === 400)
+  res = fakeRes()
+  await settingsRoute2.handler(fakeReq('POST', '/subagent-vision/settings', [Buffer.from(JSON.stringify({ action: 'declareImage', provider: 'pi-ai', model: 'qwen3.8-max' }))]), res)
+  check('declareImage already-declared model refused', res.state.status === 400)
+  res = fakeRes()
+  await settingsRoute2.handler(fakeReq('POST', '/subagent-vision/settings', [Buffer.from(JSON.stringify({ action: 'declareImage', provider: 'pi-ai' }))]), res)
+  check('declareImage missing model refused', res.state.status === 400)
+  res = fakeRes()
+  await settingsRoute2.handler(
+    fakeReq('POST', '/subagent-vision/settings', [Buffer.from(JSON.stringify({ action: 'declareImage', provider: 'deepseek-official', model: 'deepseek-v4-flash' }))]),
+    res,
+  )
+  check(
+    'declareImage refused for a schema that cannot express input',
+    res.state.status === 400 && String(JSON.parse(res.state.body).error).includes('cannot declare image input'),
+    res.state.body,
+  )
+}
+
+// 12: with only text-only models configured, the picker's HTTP surface names
+// the undecided models in its hint (the empty-options case).
+{
+  const ctxHint = new Context()
+  const httpRoutesHint = []
+  ctxHint.provide('systemPrompt', { section: () => {} })
+  ctxHint.provide('llm', {
+    listConfigurableProviders: () => [
+      { provider: 'pi-ai', displayName: 'Qwen (DashScope)', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'qwen'] },
+    ],
+    resolveModelInfo: async () => ({ inputModalities: ['text'] }),
+  })
+  ctxHint.provide('settings', {
+    get() {
+      return { providers: { qwen: { defaultInput: ['text'], models: [{ id: 'qwen-flash', name: 'qwen-flash' }] } } }
+    },
+    register() {
+      return { get: () => ({}), watch: () => {} }
+    },
+    replace() {},
+  })
+  ctxHint.provide('webServer', { register: (route) => httpRoutesHint.push(route) })
+  host.apply(ctxHint, { persistToPatch: false })
+  await flush()
+  const route = httpRoutesHint.find((r) => r.path === '/subagent-vision/settings')
+  check('hint-only context registers the picker route', route !== undefined)
+  if (route) {
+    const res = fakeRes()
+    await route.handler(fakeReq('GET', '/subagent-vision/settings'), res)
+    const got = JSON.parse(res.state.body)
+    check('empty options served with only text-only models', Array.isArray(got.options) && got.options.length === 0)
+    check(
+      'hint names the configured-but-undecided model',
+      Array.isArray(got.undecided) && got.undecided.some((u) => u.model === 'qwen-flash') && typeof got.hint === 'string' && got.hint.includes('qwen-flash'),
+      JSON.stringify({ undecided: got.undecided, hint: got.hint }),
+    )
+  }
 }
 
 console.log(failures === 0 ? 'ALL SETTINGS CHECKS PASSED' : `${failures} CHECK(S) FAILED`)
