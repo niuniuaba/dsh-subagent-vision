@@ -1,6 +1,6 @@
 {
   "name": "dsh-subagent-vision",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "dsh bundle: subagent_vision — delegate image reading to a vision-capable model from a text-only session, plus paste-to-path so pasted images reach the subagent as file paths.",
   "type": "module",
   "main": "./index.js",
