@@ -135,12 +135,20 @@ const piAiDoc = {
 }
 
 /**
- * A settings schema that cannot express model input (DeepSeek-style): no
- * `defaultInput` on the provider node, and model entries carry no modality
- * field. Such models must never be offered the one-click declare action.
+ * The RESOLVED llm-deepseek settings document as the real schema serves it:
+ * `inputModalities` is materialized on every catalog entry, and the default
+ * catalog ships deepseek-v4-flash-vision-exp image-capable — the regression
+ * this test guards, because the picker must recognize that spelling and offer
+ * the model. The provider node has no `defaultInput` marker, so its models can
+ * never be offered the one-click declare action (the schema cannot carry an
+ * `input` declaration, and the model needs none — it already declares image).
  */
 const deepSeekDoc = {
-  models: [{ id: 'deepseek-v4-flash', name: 'DeepSeek-V4-Flash' }],
+  models: [
+    { id: 'deepseek-v4-flash', name: 'DeepSeek-V4-Flash', inputModalities: ['text'] },
+    { id: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro', inputModalities: ['text'] },
+    { id: 'deepseek-v4-flash-vision-exp', name: 'DeepSeek-V4-Flash-Vision-Exp', inputModalities: ['text', 'image'] },
+  ],
 }
 
 /** Minimal path-op application for the stub (plain-object steps only). */
@@ -163,6 +171,50 @@ const stubLlm = {
     { provider: 'deepseek-official', displayName: 'DeepSeek', settingsNs: 'llm-deepseek', settingsPath: [] },
   ],
   resolveModelInfo: async (provider, model) => resolveImpl(provider, model),
+  // Authoritative adapter catalog, mirroring the real adapters: pi-ai reads
+  // its settings document (declare writes land here), while llm-deepseek ships
+  // deepseek-v4-flash-vision-exp image-capable in its default catalog even
+  // when the settings document never names a modality — the regression this
+  // test guards (the model must still appear in the picker).
+  listModels: async (provider) => {
+    if (provider === 'pi-ai') {
+      const doc = stubSettings.get('llm-pi-ai')
+      return (doc.providers?.qwen?.models ?? []).map((m) => ({
+        provider,
+        id: m.id,
+        name: m.name ?? m.id,
+        inputModalities: Array.isArray(m.input) ? [...m.input] : ['text'],
+      }))
+    }
+    if (provider === 'anthropic') {
+      const doc = stubSettings.get('llm-anthropic')
+      return (doc.models ?? []).map((m) => ({
+        provider,
+        id: m.id,
+        name: m.name ?? m.id,
+        inputModalities: Array.isArray(m.input) ? [...m.input] : ['text'],
+      }))
+    }
+    if (provider === 'deepseek-official') {
+      const doc = stubSettings.get('llm-deepseek')
+      const models = (doc?.models ?? []).map((m) => ({
+        provider,
+        id: m.id,
+        name: m.name ?? m.id,
+        inputModalities: Array.isArray(m.inputModalities) ? [...m.inputModalities] : ['text'],
+      }))
+      if (!models.some((m) => m.id === 'deepseek-v4-flash-vision-exp')) {
+        models.push({
+          provider,
+          id: 'deepseek-v4-flash-vision-exp',
+          name: 'DeepSeek-V4-Flash-Vision-Exp',
+          inputModalities: ['text', 'image'],
+        })
+      }
+      return models
+    }
+    throw new Error(`no adapter for ${provider}`)
+  },
 }
 
 const stubLoader = {
@@ -213,9 +265,10 @@ if (reg) {
   const options = [...schema.matchAll(/"value":"([^"]+)","label":"([^"]+)"/g)].map((m) => ({ value: m[1], label: m[2] }))
   check(
     'select options are the image-declaring configured models',
-    options.length === 2
+    options.length === 3
       && options.some((o) => o.value === 'pi-ai/qwen3.8-max' && o.label === 'Qwen (DashScope): qwen3.8-max')
-      && options.some((o) => o.value === 'anthropic/claude-3.7'),
+      && options.some((o) => o.value === 'anthropic/claude-3.7')
+      && options.some((o) => o.value === 'deepseek-official/deepseek-v4-flash-vision-exp'),
     JSON.stringify(options),
   )
   check('text-only model excluded from options', !options.some((o) => o.value.includes('qwen-flash')))
@@ -327,7 +380,10 @@ if (settingsRoute) {
   const got = JSON.parse(getRes.state.body)
   check(
     'GET serves options/current/hint',
-    got.options.length === 2 && got.current === 'pi-ai/qwen3.8-max' && typeof got.hint === 'string',
+    got.options.length === 3
+      && got.current === 'pi-ai/qwen3.8-max'
+      && got.options.some((o) => o.value === 'deepseek-official/deepseek-v4-flash-vision-exp')
+      && typeof got.hint === 'string',
     JSON.stringify(got),
   )
   // POST a new choice: settings.replace persists it and the section watch

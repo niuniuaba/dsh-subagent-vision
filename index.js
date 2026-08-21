@@ -16,14 +16,18 @@
 //
 // Vision-route settings: a settings section (`subagent-vision` namespace)
 // lets the user pick which model subagent_vision delegates to. The options
-// are enumerated from the deployment's configurable-provider directory
-// (llm.listConfigurableProviders + the provider's settings document) and
-// filtered to models that positively declare image input — the same
-// metadata the paste verdict trusts. The choice is stored in the settings
-// system (settings.yaml, GUI-editable, survives restarts) AND persisted into
-// this bundle's own cordis.patch.yml, so the tool row starts with the chosen
-// agentOptions on the next boot even if the runtime settings->agentOptions
-// sync cannot apply it live. Clearing the choice removes the hardcode again.
+// are enumerated live from the authoritative adapter catalog
+// (llm.listConfigurableProviders + llm.listModels, which merges catalog and
+// settings and normalizes modalities onto inputModalities) and filtered to
+// models that positively declare image input — the same metadata the paste
+// verdict trusts. That makes adapter-shipped vision models (e.g.
+// llm-deepseek's deepseek-v4-flash-vision-exp) selectable even when their
+// settings entries never name a modality. The choice is stored in the
+// settings system (settings.yaml, GUI-editable, survives restarts) AND
+// persisted into this bundle's own cordis.patch.yml, so the tool row starts
+// with the chosen agentOptions on the next boot even if the runtime
+// settings->agentOptions sync cannot apply it live. Clearing the choice
+// removes the hardcode again.
 import { settingsNamespace, installSettingsSection } from '@deepseek-ai/dsh-settings'
 import z from '@deepseek-ai/schemastery'
 import { readFile, rename, writeFile } from 'node:fs/promises'
@@ -268,6 +272,22 @@ function providerModels(entry, readSettings) {
 }
 
 /**
+ * Whether a model entry declares image input. Settings documents name the
+ * modality field per adapter: pi-ai's model profile uses `input`, while
+ * llm-deepseek's catalog entries use `inputModalities`. Every consumer (the
+ * paste verdict, the child's read_image gate, this picker) reads the adapter's
+ * own declaration, so the picker must recognize both spellings.
+ * @param model - one model entry from a provider settings document or catalog.
+ * @returns whether the entry declares image among its input modalities.
+ */
+function modelDeclaresImage(model) {
+  return (
+    (Array.isArray(model?.input) && model.input.includes('image'))
+    || (Array.isArray(model?.inputModalities) && model.inputModalities.includes('image'))
+  )
+}
+
+/**
  * Whether a provider's settings schema can express model input modalities.
  * The one-click declare action writes `input: [text, image]` into a model
  * entry; that is only honest when the provider's settings schema declares the
@@ -286,10 +306,14 @@ function canExpressInput(node) {
 
 /**
  * Enumerate the vision-capable models a deployment has actually configured.
+ * Reads the provider's settings document, which carries the same declarations
+ * the paste verdict and the child's read_image gate trust — a model entry
+ * declares image input under its adapter's field spelling (`input` for pi-ai,
+ * `inputModalities` for llm-deepseek).
  * @param providers - `llm.listConfigurableProviders()` output: each entry
  *   carries `provider`, `displayName`, `settingsNs`, `settingsPath`.
  * @param readSettings - `(ns) => document` for the settings service.
- * @returns `{ value, label }` routes for models whose `input` declares image,
+ * @returns `{ value, label }` routes for models whose input declares image,
  *   deduplicated, in provider order.
  */
 export function enumerateVisionRoutes(providers, readSettings) {
@@ -300,7 +324,46 @@ export function enumerateVisionRoutes(providers, readSettings) {
     if (found === null) continue
     for (const model of found.models) {
       if (typeof model?.id !== 'string' || model.id === '') continue
-      if (!Array.isArray(model.input) || !model.input.includes('image')) continue
+      if (!modelDeclaresImage(model)) continue
+      const value = `${entry.provider}/${model.id}`
+      if (seen.has(value)) continue
+      seen.add(value)
+      routes.push({
+        value,
+        label: `${entry.displayName}: ${typeof model.name === 'string' && model.name !== '' ? model.name : model.id}`,
+      })
+    }
+  }
+  return routes
+}
+
+/**
+ * Enumerate the vision-capable models a deployment can actually route to, from
+ * the authoritative adapter catalog instead of the settings document alone.
+ * `ctx.llm.listModels(provider)` merges each adapter's catalog with its
+ * settings overrides and normalizes modalities onto `inputModalities`, so a
+ * model the adapter ships image-capable out of the box — such as llm-deepseek's
+ * `deepseek-v4-flash-vision-exp` — is offered even when its settings entry
+ * never names a modality. Providers that only declare a directory without a
+ * registered adapter are skipped (their models cannot be routed to anyway).
+ * @param llm - the `ctx.llm` service.
+ * @returns `{ value, label }` routes, deduplicated, in provider order.
+ */
+export async function enumerateVisionRoutesLive(llm) {
+  const providers = typeof llm?.listConfigurableProviders === 'function' ? llm.listConfigurableProviders() : []
+  const seen = new Set()
+  const routes = []
+  for (const entry of providers) {
+    if (typeof llm?.listModels !== 'function') continue
+    let models
+    try {
+      models = await llm.listModels(entry.provider)
+    } catch {
+      continue // dormant provider without a registered adapter: nothing routable
+    }
+    for (const model of models ?? []) {
+      if (typeof model?.id !== 'string' || model.id === '') continue
+      if (!Array.isArray(model.inputModalities) || !model.inputModalities.includes('image')) continue
       const value = `${entry.provider}/${model.id}`
       if (seen.has(value)) continue
       seen.add(value)
@@ -336,7 +399,7 @@ export function enumerateUndecidedModels(providers, readSettings) {
     if (!canExpressInput(found.node)) continue
     for (const model of found.models) {
       if (typeof model?.id !== 'string' || model.id === '') continue
-      if (Array.isArray(model.input) && model.input.includes('image')) continue
+      if (modelDeclaresImage(model)) continue
       const value = `${entry.provider}/${model.id}`
       if (seen.has(value)) continue
       seen.add(value)
@@ -553,9 +616,29 @@ function insertAfterConfigKeys(lines, config, keyIndent, wanted) {
 // One serialized persist at a time: settings can change while a write is in
 // flight, and the final state must win.
 let persistChain = Promise.resolve()
-function queuePersist(route) {
+
+/**
+ * Persist a route only while it is still selectable under the authoritative
+ * adapter catalog, so a stale/unresolvable stored route never overwrites the
+ * patch file's last good hardcode — and an adapter-shipped vision model (e.g.
+ * llm-deepseek's `deepseek-v4-flash-vision-exp`) does persist, exactly as the
+ * picker's HTTP route would accept it. An empty options list means the
+ * provider directory has not settled yet; mirroring the settings is still safe
+ * then (the boot-time value mirrors the file, so the write is idempotent
+ * anyway). Runs on the persist chain so concurrent settings changes stay
+ * ordered and the final state wins.
+ * @param ctx - plugin context carrying the llm service.
+ * @param route - `provider/model` to hardcode, or `''` to clear.
+ */
+function queuePersistSelectable(ctx, route) {
   persistChain = persistChain
-    .then(() => persistToolRoute(route))
+    .then(async () => {
+      if (route === '') return persistToolRoute('')
+      const [p, m] = splitVisionRoute(route)
+      if (!p || !m) return
+      const options = (await enumerateVisionRoutesLive(ctx.llm)).map((r) => r.value)
+      if (options.length === 0 || options.includes(route)) await persistToolRoute(route)
+    })
     .catch((error) => {
       console.error(`[dsh-subagent-vision] persist failed: ${error?.message ?? error}`)
     })
@@ -603,16 +686,10 @@ function registerVisionRouteSettings(ctx, config) {
         onChange: () => {
           visionRoute = source?.()?.[ROUTE_FIELD] ?? ''
           if (config.persistToPatch !== false) {
-            // Only persist a parseable route that is currently selectable (or
-            // the clear case); a stale/unresolvable stored route must not
-            // overwrite the file's last good hardcode. An empty options list
-            // means the provider directory has not settled yet — mirroring the
-            // settings is still safe then (the boot-time value mirrors the
-            // file, so the write is idempotent anyway).
-            const options = enumerateNow().map((r) => r.value)
-            const [p, m] = splitVisionRoute(visionRoute)
-            const persistable = visionRoute === '' || (Boolean(p && m) && (options.length === 0 || options.includes(visionRoute)))
-            if (persistable) queuePersist(visionRoute)
+            // Only persist a route the authoritative adapter catalog still
+            // offers (or the clear case); a stale/unresolvable stored route
+            // must not overwrite the file's last good hardcode.
+            queuePersistSelectable(ctx, visionRoute)
           }
           queueToolRouteSync(ctx, visionRoute)
         },
@@ -629,8 +706,15 @@ function registerVisionRouteSettings(ctx, config) {
     ctx.inject(['webServer'], (scope) => {
       try {
         registerVisionRouteHttp(scope, ctx, {
-          read: () => {
-            const options = enumerateNow().map((r) => ({ value: r.value, label: r.label }))
+          read: async () => {
+            // Authoritative enumeration: the adapter catalog (listModels)
+            // merges catalog + settings and normalizes modalities, so every
+            // routable image model appears — including adapter-shipped ones
+            // whose settings entries never name a modality. The schema's
+            // boot-time options stay on the synchronous settings-document
+            // enumeration (a schema cannot await), but the picker reads this
+            // live view.
+            const options = (await enumerateVisionRoutesLive(ctx.llm)).map((r) => ({ value: r.value, label: r.label }))
             const undecided = undecidedNow()
             return {
               options,
@@ -671,7 +755,7 @@ function registerVisionRouteHttp(scope, ctx, io) {
     path: '/subagent-vision/settings',
     handler: async (req, res) => {
       if (req.method === 'GET') {
-        const { options, undecided, hint, current } = io.read()
+        const { options, undecided, hint, current } = await io.read()
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ options, undecided, hint, current }))
         return
@@ -692,14 +776,14 @@ function registerVisionRouteHttp(scope, ctx, io) {
             throw new Error('declareImage needs provider and model')
           }
           await io.declare(parsed.provider, parsed.model)
-          const { options } = io.read()
+          const { options } = await io.read()
           res.writeHead(200, { 'content-type': 'application/json' })
           res.end(JSON.stringify({ ok: true, options }))
           return
         }
         const route = parsed.visionRoute
         if (typeof route !== 'string') throw new Error('visionRoute must be a string')
-        const { options } = io.read()
+        const { options } = await io.read()
         if (options.length > 0 && !options.some((o) => o.value === route)) {
           throw new Error(`unknown vision route ${JSON.stringify(route)}`)
         }
