@@ -57,40 +57,44 @@ function fakeReq(method, url, chunks) {
   return req
 }
 
+/** The RAW anthropic settings document the stub stores and serves. */
+const anthropicDoc = {
+  models: [{ id: 'claude-3.7', name: 'Claude 3.7', input: ['text', 'image'] }],
+}
+
 const stubSettings = {
   // get() serves the RESOLVED view (schema-materialized: `defaultInput` on the
   // provider node, `compat: {}` on model entries) — what the plugin's
   // enumeration and capability check read.
   get(ns) {
     if (ns === 'llm-pi-ai') return resolvedPiAi(piAiDoc)
-    if (ns === 'llm-anthropic') {
-      return {
-        models: [{ id: 'claude-3.7', name: 'Claude 3.7', input: ['text', 'image'] }],
-      }
-    }
+    if (ns === 'llm-anthropic') return anthropicDoc
     if (ns === 'llm-deepseek') return deepSeekDoc
     return undefined
   },
-  // section() serves the RAW stored view (exactly what settings.yaml holds) —
-  // what the declare route rewrites, so schema-materialized fields never leak
-  // into storage.
-  section(ns) {
-    if (ns === 'llm-pi-ai') return piAiDoc
-    if (ns === 'llm-anthropic') {
-      return {
-        models: [{ id: 'claude-3.7', name: 'Claude 3.7', input: ['text', 'image'] }],
-      }
-    }
-    if (ns === 'llm-deepseek') return deepSeekDoc
-    return undefined
+  // describe() serves each namespace's RAW stored user layer (exactly what
+  // settings.yaml holds) — what the declare route rewrites, so
+  // schema-materialized fields never leak into storage.
+  describe() {
+    return [
+      { ns: 'llm-pi-ai', user: piAiDoc },
+      { ns: 'llm-anthropic', user: anthropicDoc },
+      { ns: 'llm-deepseek', user: deepSeekDoc },
+    ]
   },
-  register(ns, schema, opts) {
-    registrations.push({ ns, schema, base: opts.base })
+  // The dsh-v0.1.2-alpha.2 settings API: the host service installs the
+  // consumer's section (composition entry as the base layer), hands the
+  // plugin its source thunk, and re-invokes onChange on every committed
+  // change. Mirrors SettingsProvider.installSection's wiring.
+  installSection(owner, ns, schema, entry, hooks) {
+    registrations.push({ ns, schema, base: entry })
     const scope = {
-      get: () => userValue ?? opts.base,
+      get: () => userValue ?? entry,
       watch: (fn) => watchers.push(fn),
     }
-    return scope
+    hooks.setSource(() => scope.get())
+    hooks.onChange()
+    scope.watch(() => hooks.onChange())
   },
   replace(ns, section) {
     userValue = section
@@ -120,7 +124,7 @@ function resolvedPiAi(raw) {
 
 /**
  * The RAW pi-ai settings document the stub stores and serves through
- * `section()`. Mutable so the declare route's write can be observed:
+ * `describe()`. Mutable so the declare route's write can be observed:
  * `mutate` applies path ops onto it and `get()` re-derives the resolved view.
  */
 const piAiDoc = {
@@ -346,9 +350,10 @@ ctxEmpty.provide('settings', {
   get() {
     return { providers: { qwen: { defaultInput: ['text'], models: [{ id: 'qwen-flash', name: 'qwen-flash', input: ['text'] }] } } }
   },
-  register(ns, schema, opts) {
-    registrationsEmpty.push({ ns, schema, base: opts.base })
-    return { get: () => opts.base, watch: () => {} }
+  installSection(owner, ns, schema, entry, hooks) {
+    registrationsEmpty.push({ ns, schema, base: entry })
+    hooks.setSource(() => entry)
+    hooks.onChange()
   },
   replace() {},
 })
