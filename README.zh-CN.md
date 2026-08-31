@@ -26,7 +26,7 @@ bundle 的 `cordis.patch.yml` 向 profile 组合插入两行：
 - 已安装挂载了子代理能力、tool-fs（`read_image`）、attachments 和 Web 表面的 dsh base bundle（官方 `web` profile 满足；浏览器半区需要 Web GUI）。
 - 在**「设置 > 模型」**中至少配置一个支持图片输入的视觉模型（模型元数据声明 image input）。发布的 patch 出厂默认 `qwen/qwen3.8-max`：若你的部署没有该模型，可以配置它，或在「设置 > 视觉处理模型」里改选自己的模型，或直接修改插件 `cordis.patch.yml` 中的 `agentOptions` 字段。
 - 粘贴的图片不能超过路由上限（默认 25 MB）；子代理 `read_image` 读取文件时会套用部署的规范图片限额。
-- 运行时依赖从 profile 解析（宿主侧 `@deepseek-ai/dsh-settings`、`@deepseek-ai/schemastery`；客户端 `react` 来自 client 模块系统）。
+- 运行时依赖从 profile 解析（宿主侧 `@deepseek-ai/schemastery`；直接使用宿主的 `settings` 服务；客户端 `react` 来自 client 模块系统）。
 
 ## 安装
 

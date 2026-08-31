@@ -26,7 +26,7 @@ The child is composed like any in-process subagent: its own session, its own too
 - A dsh installation whose base bundle mounts the subagent capability, tool-fs (`read_image`), attachments, and the Web surface (the stock `web` profile does; the browser half needs the Web GUI).
 - At least one vision-capable model configured through **Settings > Models** (model metadata declaring image input). The shipped patch's factory default is `qwen/qwen3.8-max`: if that model isn't configured in your deployment, either configure it, pick your own model in Settings > 视觉处理模型, or edit the `agentOptions` field in the bundle's `cordis.patch.yml`.
 - The pasted image must fit the route cap (25 MB default); the child's `read_image` applies the deployment's canonical image limits when it reads the file.
-- Runtime dependencies resolved from the profile (`@deepseek-ai/dsh-settings`, `@deepseek-ai/schemastery` host-side; `react` from the client module system).
+- Runtime dependencies resolved from the profile (`@deepseek-ai/schemastery` host-side; the host's `settings` service is used as-is; `react` from the client module system).
 
 ## Install
 

@@ -28,7 +28,6 @@
 // with the chosen agentOptions on the next boot even if the runtime
 // settings->agentOptions sync cannot apply it live. Clearing the choice
 // removes the hardcode again.
-import { settingsNamespace, installSettingsSection } from '@deepseek-ai/dsh-settings'
 import z from '@deepseek-ai/schemastery'
 import { readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
@@ -38,7 +37,7 @@ export const name = 'subagent-vision'
 export const inject = ['systemPrompt', 'llm']
 
 /** Settings namespace owning the user's vision-route choice. */
-const SETTINGS_NS = settingsNamespace('subagent-vision')
+const SETTINGS_NS = 'subagent-vision'
 /** The patch row whose agentOptions the choice is synced onto. */
 const TOOL_ENTRY_ID = 'tool-subagent-vision'
 /** The stored value's shape: a `provider/model` string. */
@@ -434,8 +433,9 @@ function routeHint(options, undecided) {
  * the settings service exposes it. A declare must rewrite the models array
  * from what is actually stored — the resolved document materializes schema
  * fields (`compat: {}`, `input: []`, …) that a write would otherwise leak
- * into `settings.yaml`. Falls back to `undefined` so the caller can use the
- * resolved document instead.
+ * into `settings.yaml`. The raw user layer comes from the namespace
+ * descriptor (`settings.describe()` → `user`); falls back to `undefined` so
+ * the caller can use the resolved document instead.
  * @param sctx - scoped context carrying the settings service.
  * @param entry - one `llm.listConfigurableProviders()` entry.
  * @returns the walked raw provider node, or `undefined` when unavailable.
@@ -443,7 +443,7 @@ function routeHint(options, undecided) {
 function rawProviderNode(sctx, entry) {
   let node
   try {
-    node = sctx.settings.section?.(entry.settingsNs)
+    node = sctx.settings.describe().find((d) => d.ns === entry.settingsNs)?.user
   } catch {
     return undefined
   }
@@ -675,7 +675,7 @@ function registerVisionRouteSettings(ctx, config) {
             : field.required().description('选择用于 subagent_vision 委派读图的视觉模型（来自「设置 > 模型」中已配置的模型）。'),
       })
       const entry = { [ROUTE_FIELD]: initial }
-      installSettingsSection(ctx, SETTINGS_NS, schema, entry, {
+      sctx.settings.installSection(ctx, SETTINGS_NS, schema, entry, {
         setSource: (read) => {
           source = read
         },
