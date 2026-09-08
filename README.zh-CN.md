@@ -10,12 +10,12 @@ DeepSeek 聊天模型不支持图片输入，而 harness 又拒绝把含图的�
 
 ## 工作原理
 
-bundle 的 `cordis.patch.yml` 向 profile 组合插入两行：
+bundle 的 `cordis.patch.yml` 向 profile 组合插入一行：
 
-- **`tool-subagent-vision`** — 第二个 `@deepseek-ai/dsh-tool-subagent` 实例（`toolName: subagent_vision`、`provider: spawn`、`backgroundMode: one-shot`）。该行以发布版 `cordis.patch.yml` 中的**出厂默认 `agentOptions`**（qwen/qwen3.8-max）启动，保证开箱即用；在「设置 > 视觉处理模型」里改选模型会把该选择**写回这个 patch 文件**（新路由下次重启生效，实时 loader 同步成功时也会立即生效）；出问题时可直接编辑该文件的 `agentOptions` 字段。图片块永远不会进入父会话：父代理在工具 prompt 里传**文件路径或 URL**，视觉子代理用自己的 `read_image` 工具读取（该工具的执行闸门检查的是*子代理*的路由模型，它声明支持图片），只有子代理最终的**文本**作为工具结果返回。
-- **`subagent-vision`** — 本包根插件，做三件事：
+- **`subagent-vision`** — 本包根插件，挂载两个半区、做四件事：
+  - **视觉工具**（`tool.js`）：在公开的 `ctx.tools` / `ctx.subagents` 接缝上注册 `subagent_vision` 委派工具——本包自己实现该工具，不再通过 patch 插入其他 bundle 的第二个 subagent 工具实例。该行的 `visionTool` 配置块携带 provider 名（默认 `spawn`）与子代理的 `agentOptions`；工具随该 provider 出现而出现、消失而消失。该行以发布版 `cordis.patch.yml` 中的**出厂默认 `agentOptions`**（qwen/qwen3.8-max）启动，保证开箱即用；在「设置 > 视觉处理模型」里改选模型会把该选择**写回这个 patch 文件**（新路由下次重启生效，实时 loader 同步成功时也会立即生效）；出问题时可直接编辑该文件的 `agentOptions` 字段。图片块永远不会进入父会话：父代理在工具 prompt 里传**文件路径或 URL**，视觉子代理用自己的 `read_image` 工具读取（该工具的执行闸门检查的是*子代理*的路由模型，它声明支持图片），只有子代理最终的**文本**作为工具结果返回。
   - **引导提示词**：注册一段提示词，告诉模型何时用 `subagent_vision`（自带的 subagent 工具描述里完全没提视觉）。未配置路由时，它会告诉模型*不要*调用该工具、先让用户配置。
-  - **视觉路由设置**：注册 `subagent-vision` 命名空间的设置 section（持久化到 `settings.yaml`），浏览器半区渲染「设置 > 视觉处理模型」入口。下拉框列出**所有可路由且声明支持图片输入的模型**——从 adapter 目录实时枚举（`ctx.llm.listModels`，合并各 provider 的 catalog 与 settings 覆盖），所以 adapter 自带的多模态模型（如 llm-deepseek 默认 catalog 里的 `deepseek-v4-flash-vision-exp`）即使 settings 条目从未声明模态也会出现（与 paste 裁决信任的是同一份元数据）；没有可用模型时，提示会**点名已配置但未声明图片输入的模型**，并为每个模型提供一键**「声明支持图片输入」**按钮（把 `input: [text, image]` 写进该模型在 provider settings 文档里的条目，如 `settings.yaml`——「设置 > 模型」界面本身无法表达输入模态，所以在那里配置的模型默认按纯文本处理，直到显式声明）。选择结果在注册时和设置每次变更时同步到工具行的 `agentOptions`，**并持久化进本 bundle 自己的 `cordis.patch.yml`**——即使实时同步失效，工具行也会在下次启动时带着所选路由；若保存的模型已无法解析、或未声明图片输入，会被拒绝。
+  - **视觉路由设置**：注册 `subagent-vision` 命名空间的设置 section（持久化到 `settings.yaml`），浏览器半区渲染「设置 > 视觉处理模型」入口。下拉框列出**所有可路由且声明支持图片输入的模型**——从 adapter 目录实时枚举（`ctx.llm.listModels`，合并各 provider 的 catalog 与 settings 覆盖），所以 adapter 自带的多模态模型（如 llm-deepseek 默认 catalog 里的 `deepseek-v4-flash-vision-exp`）即使 settings 条目从未声明模态也会出现（与 paste 裁决信任的是同一份元数据）；没有可用模型时，提示会**点名已配置但未声明图片输入的模型**，并为每个模型提供一键**「声明支持图片输入」**按钮（把 `input: [text, image]` 写进该模型在 provider settings 文档里的条目，如 `settings.yaml`——「设置 > 模型」界面本身无法表达输入模态，所以在那里配置的模型默认按纯文本处理，直到显式声明）。选择结果在注册时和设置每次变更时同步到该行的 `visionTool.agentOptions`，**并持久化进本 bundle 自己的 `cordis.patch.yml`**——即使实时同步失效，工具也会在下次启动时带着所选路由；若保存的模型已无法解析、或未声明图片输入，会被拒绝。
   - **Paste-to-path 路由**（`/subagent-vision/paste`）：`GET` 回答给定 `provider`/`model` 是否被**正向确认**为纯文本（依据 `inputModalities`，绝不靠名字猜测）；`POST` 校验图片 magic bytes（PNG/JPEG/GIF/WebP/HEIC/HEIF）、强制 25 MB 上限、写入私有 `0600` 临时文件并返回路径。
 - **浏览器半区**（`client.js`，通过包的 `dsh.client` 清单自动加载）：**摄入保持完全原生**——粘贴或拖放图片走 composer 自己的缩略图栏、原生光标行为与删除/撤销。插件的唯一拦截点在**发送时**：当草稿携带图片附件且目标会话模型被**正向确认**为纯文本（host 裁决，基于 `inputModalities`，60 秒缓存、过期重问）时，把每张草稿图片上传到宿主路由（POST /subagent-vision/paste → 私有临时路径）、释放草稿，并把路径追加到提示文本后再真正发送——请求只带文本，永不触发图片准入。支持图片的模型与未知模型原样带图发送。
 
@@ -26,7 +26,7 @@ bundle 的 `cordis.patch.yml` 向 profile 组合插入两行：
 - 已安装挂载了子代理能力、tool-fs（`read_image`）、attachments 和 Web 表面的 dsh base bundle（官方 `web` profile 满足；浏览器半区需要 Web GUI）。
 - 在**「设置 > 模型」**中至少配置一个支持图片输入的视觉模型（模型元数据声明 image input）。发布的 patch 出厂默认 `qwen/qwen3.8-max`：若你的部署没有该模型，可以配置它，或在「设置 > 视觉处理模型」里改选自己的模型，或直接修改插件 `cordis.patch.yml` 中的 `agentOptions` 字段。
 - 粘贴的图片不能超过路由上限（默认 25 MB）；子代理 `read_image` 读取文件时会套用部署的规范图片限额。
-- 运行时依赖从 profile 解析（宿主侧 `@deepseek-ai/schemastery`；直接使用宿主的 `settings` 服务；客户端 `react` 来自 client 模块系统）。
+- 运行时依赖从 profile 解析（宿主侧 `@deepseek-ai/schemastery`；本包构建其上的 harness 服务——`tools`、`subagents`、`systemPrompt`、`llm`、`settings`，以及可选的 `jobs`——由 dsh 安装本身提供；客户端 `react` 来自 client 模块系统）。
 
 ## 安装
 
@@ -90,13 +90,14 @@ agentOptions:
 
 （在自己 profile 的 `cordis.patch.yml` 中加同 id 的行也可以覆盖本行——后层 patch 生效。）如果下拉框显示的是点名你已配置模型的提示（并带「声明支持图片输入」按钮），点击该按钮（或在 `settings.yaml` 为该模型条目加 `input: [text, image]`），然后刷新设置页——列表是实时重新枚举的。
 
-host 插件通过 `subagent-vision` 行的 config 配置：`toolName`、`modelHint`、`order`、`visionSettings: false`（关闭设置 section 与选择器）、`pasteToPath: false`（关闭接管；路由 404 时客户端自动停摆）、`maxBytes`、`verdictTtlMs`。
+插件通过 `subagent-vision` 行的 config 配置：`visionTool`（`provider`、`toolName`、`enableRunInBackground` 与子代理 `agentOptions`；`visionTool: false` 关闭工具半区）、`modelHint`、`order`、`visionSettings: false`（关闭设置 section 与选择器）、`pasteToPath: false`（关闭接管；路由 404 时客户端自动停摆）、`maxBytes`、`verdictTtlMs`。
 
 ## 验证
 
-在仓库根目录运行：
+在插件目录运行（先 `npm install`）：
 
 ```sh
+node verify.mjs                   # 工具注册、委派接线、引导提示词、paste 路由
 node verify-settings.mjs          # 设置 section、模型枚举、选择器路由、工具行同步
 node verify-live.mjs              # 真实实例：点名提示 + 一键声明（见下）
 node browser-verify/driver.mjs    # 浏览器半区（真实 Chrome，见 browser-verify/README.md）
@@ -104,13 +105,13 @@ node browser-verify/driver.mjs    # 浏览器半区（真实 Chrome，见 browse
 
 `verify-live.mjs` 直接驱动**正在运行的** dsh web 实例（经 `/subagent-vision/settings`）：在待测模型暂时未声明图片输入（选项为空）的前提下，断言提示点名了已配置但未声明的模型、POST `declareImage` 动作、并断言模型重新可选——声明动作本身就还原了配置。用法：`node verify-live.mjs [baseURL] [provider] [model]`（默认 `http://127.0.0.1:3080 qwen qwen3.8-max`）。
 
-`verify-settings.mjs` 在真实 cordis 上下文 + stub `llm`/`settings`/`loader` 服务下运行 host 插件，断言：`subagent-vision` 设置 section 完成注册、下拉选项恰好是 adapter 目录中声明图片输入的模型（包括 settings 条目从未声明模态的 adapter 自带视觉模型）、注册与设置变更都会同步工具行的 `agentOptions`（保留其余配置）、无法解析或不支持图片的路由会被拒绝、选择器的 HTTP 路由能读取并持久化选择、未声明图片输入的已配置模型会被点名且支持一键声明、无模型提示正常渲染。浏览器套件在真实 Chrome 里驱动发货的 `client.js` 对抗真实 paste 路由。
+`verify-settings.mjs` 在真实 cordis 上下文 + stub `llm`/`settings`/`loader` 服务下运行 host 插件，断言：`subagent-vision` 设置 section 完成注册、下拉选项恰好是 adapter 目录中声明图片输入的模型（包括 settings 条目从未声明模态的 adapter 自带视觉模型）、注册与设置变更都会同步该行的 `visionTool.agentOptions`（保留其余配置）、无法解析或不支持图片的路由会被拒绝、选择器的 HTTP 路由能读取并持久化选择、未声明图片输入的已配置模型会被点名且支持一键声明、无模型提示正常渲染。浏览器套件在真实 Chrome 里驱动发货的 `client.js` 对抗真实 paste 路由。
 
-（插件原仓库布局依赖的 `verify.mjs` 断言工具/subagent 接线本身，需要完整的 harness 仓库树才能运行。）
+`verify.mjs` 在真实的 tools/subagents/system-prompt 服务上挂载 host 插件（配一个脚本化的 `ctx.subagents` provider 与 stub llm/webServer），断言：`subagent_vision` 工具只在对应 provider 注册后出现、执行时把配置的视觉 `agentOptions` 透传进子代理 start 请求并返回子代理文本、引导提示词正常渲染、paste 路由正确回答裁决并落盘上传。
 
 ## 限制
 
-- **没有按次调用的模型选择**：子代理路由来自部署配置的 `agentOptions`，不是模型能在任务中改的工具参数（这是 `tool-subagent` 自带 schema 的约束，不是本 bundle 的）。
+- **没有按次调用的模型选择**：子代理路由来自部署配置的 `agentOptions`，不是模型能在任务中改的工具参数（与自带 subagent 工具的固定路由约束一致）。
 - **输入框之外的 drop 保持原生**：浏览器半区接管 composer 内的粘贴和落在 textarea 上的 drop；其他位置的 drop（composer 的整页摄入）仍走缩略图栏，纯文本模型下发送时仍会撞上图片准入。
 - **冷启动首次摄入**：接管需要一份新鲜的 host 裁决，因此纯文本模型冷启动后的第一次粘贴/拖放可能走一次原生流程。
 - **临时文件会累积**：粘贴的图片落在系统临时目录的 `subagent-vision-paste-*` 下，无人删除（交给系统临时清理）。

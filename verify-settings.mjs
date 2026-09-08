@@ -225,17 +225,17 @@ const stubLoader = {
   entries: () => [
     {
       options: {
-        id: 'tool-subagent-vision',
-        name: '@deepseek-ai/dsh-tool-subagent',
+        id: 'subagent-vision',
+        name: 'dsh-subagent-vision',
         config: {
-          toolName: 'subagent_vision',
-          provider: 'spawn',
-          backgroundMode: 'one-shot',
-          agentOptions: { provider: 'pi-ai', model: 'qwen3.8-max', maxTokens: 16384 },
+          visionTool: {
+            provider: 'spawn',
+            agentOptions: { provider: 'pi-ai', model: 'qwen3.8-max', maxTokens: 16384 },
+          },
         },
       },
       update: async (next) => {
-        updates.push({ id: 'tool-subagent-vision', options: next })
+        updates.push({ id: 'subagent-vision', options: next })
       },
     },
   ],
@@ -291,16 +291,16 @@ await watchers[0]()
 await new Promise((r) => setTimeout(r, 150)) // resolve succeeds on the first attempt
 check('settings change updates the tool row', updates.length === 1)
 if (updates.length === 1) {
-  const next = updates[0].options.config.agentOptions
+  const next = updates[0].options.config.visionTool.agentOptions
   check(
     'tool row now routes to the chosen model',
-    updates[0].id === 'tool-subagent-vision'
+    updates[0].id === 'subagent-vision'
       && next.provider === 'anthropic'
       && next.model === 'claude-3.7'
       && next.maxTokens === 16384,
     JSON.stringify(next),
   )
-  check('tool row config otherwise preserved', updates[0].options.config.toolName === 'subagent_vision')
+  check('tool row config otherwise preserved', updates[0].options.config.visionTool.provider === 'spawn')
 }
 
 // 6a: an unresolvable route is refused (sync retries with backoff, then gives up)

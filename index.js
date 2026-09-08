@@ -1,10 +1,15 @@
 // dsh-subagent-vision host plugin: prompt guidance + paste-to-path route +
 // vision-route settings.
 //
+// Tool: the `subagent_vision` delegation tool itself is implemented by this
+// package (tool.js) on the public ctx.subagents / ctx.tools seams and mounted
+// under this plugin's fiber from the `visionTool` config block, so the bundle
+// patch references only this package.
+//
 // Guidance: one prompt section telling the model when to use the
-// subagent_vision tool (mounted by the sibling patch row). The stock subagent
-// tool description is generic (it says nothing about vision), so without this
-// section the model has no reason to prefer subagent_vision over subagent.
+// subagent_vision tool. The tool description says nothing about which models
+// can see images, so without this section the model has no reason to prefer
+// subagent_vision over subagent.
 //
 // Paste-to-path: under the web profile, a browser half (client.js) intercepts
 // image pastes when the current model is text-only and POSTs the bytes here.
@@ -24,22 +29,29 @@
 // llm-deepseek's deepseek-v4-flash-vision-exp) selectable even when their
 // settings entries never name a modality. The choice is stored in the
 // settings system (settings.yaml, GUI-editable, survives restarts) AND
-// persisted into this bundle's own cordis.patch.yml, so the tool row starts
-// with the chosen agentOptions on the next boot even if the runtime
-// settings->agentOptions sync cannot apply it live. Clearing the choice
-// removes the hardcode again.
+// persisted into this bundle's own cordis.patch.yml, so the tool starts with
+// the chosen agentOptions on the next boot even if the runtime
+// settings->config sync cannot apply it live. Clearing the choice removes the
+// hardcode again.
 import z from '@deepseek-ai/schemastery'
 import { readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { mountVisionTool } from './tool.js'
 
 export const name = 'subagent-vision'
-export const inject = ['systemPrompt', 'llm']
+// `tools` and `subagents` back the tool half (tool.js); a deployment without
+// them leaves this plugin unloaded, which is correct: its whole purpose is the
+// vision delegation tool. The paste route and settings stay conditional via
+// ctx.inject below.
+export const inject = ['systemPrompt', 'llm', 'tools', 'subagents']
 
 /** Settings namespace owning the user's vision-route choice. */
 const SETTINGS_NS = 'subagent-vision'
-/** The patch row whose agentOptions the choice is synced onto. */
-const TOOL_ENTRY_ID = 'tool-subagent-vision'
+/** The loader entry id this package's patch row carries. */
+const ENTRY_ID = 'subagent-vision'
+/** The config block inside that entry carrying the tool's route. */
+const TOOL_CONFIG_KEY = 'visionTool'
 /** The stored value's shape: a `provider/model` string. */
 const ROUTE_FIELD = 'visionRoute'
 /** Shown in the settings form when no vision-capable model is configured yet. */
@@ -189,8 +201,16 @@ function registerPasteRoute(scope, host, options) {
 let visionRoute = null
 
 export function apply(ctx, config = {}) {
-  const toolName = config.toolName ?? 'subagent_vision'
+  const visionTool = config.visionTool === false ? {} : (config.visionTool ?? {})
+  // One tool name drives both halves: the guide prompt and the tool definition.
+  const toolName = visionTool.toolName ?? config.toolName ?? 'subagent_vision'
   const modelHint = config.modelHint ?? 'a vision-capable model'
+  if (config.visionTool !== false && typeof ctx.tools?.register === 'function' && typeof ctx.subagents?.getProvider === 'function') {
+    // The tool half runs inside this fiber: the same entry's `visionTool`
+    // block carries its provider and child agentOptions. A stubbed context
+    // without those services (the settings smoke) leaves the guide-only plugin.
+    mountVisionTool(ctx, { ...visionTool, toolName })
+  }
   ctx.systemPrompt.section({
     name: 'subagent-vision',
     order: config.order ?? 150,
@@ -500,15 +520,15 @@ function indentOf(line) {
 }
 
 /**
- * Persist a vision route onto the tool-subagent-vision row of this bundle's
- * own cordis.patch.yml. An empty route removes the hardcoded block; a route
- * that does not parse is ignored. The edit is structure-aware (comments and
- * sibling rows survive) and atomic (temp file + rename). No-op when the file
- * already carries the wanted block.
+ * Persist a vision route onto the `visionTool.agentOptions` block of this
+ * bundle's own cordis.patch.yml. An empty route removes the hardcoded block; a
+ * route that does not parse is ignored. The edit is structure-aware (comments
+ * and sibling keys survive) and atomic (temp file + rename). No-op when the
+ * file already carries the wanted block.
  *
  * The loader reads this file at boot, so the persisted choice makes the tool
- * row start with the user's agentOptions on the next restart even when the
- * runtime settings->agentOptions sync (queueToolRouteSync) cannot apply it
+ * start with the user's agentOptions on the next restart even when the
+ * runtime settings->config sync (queueToolRouteSync) cannot apply it
  * live. This is the durable half of the sync; the live half remains
  * best-effort on top.
  * @param route - `provider/model` to hardcode, or `''` to clear.
@@ -524,9 +544,9 @@ export async function persistToolRoute(route) {
     return false
   }
   const lines = text.split('\n')
-  const row = lines.findIndex((line) => line.trim() === `- id: ${TOOL_ENTRY_ID}`)
+  const row = lines.findIndex((line) => line.trim() === `- id: ${ENTRY_ID}`)
   if (row === -1) {
-    console.warn(`[dsh-subagent-vision] patch row ${TOOL_ENTRY_ID} not found; skipping persist`)
+    console.warn(`[dsh-subagent-vision] patch row ${ENTRY_ID} not found; skipping persist`)
     return false
   }
   // The row's config block: first `config:` after the row, before the next row.
@@ -540,16 +560,42 @@ export async function persistToolRoute(route) {
     if (trimmed.startsWith('- id:')) break
   }
   if (config === -1) {
-    console.warn(`[dsh-subagent-vision] patch row ${TOOL_ENTRY_ID} has no config block; skipping persist`)
+    console.warn(`[dsh-subagent-vision] patch row ${ENTRY_ID} has no config block; skipping persist`)
     return false
   }
-  const keyIndent = indentOf(lines[config]) + 2
+  // Locate the visionTool block (its key plus deeper children). A route can
+  // only be persisted where the tool block exists; the shipped patch always
+  // carries one.
+  const blockIndent = indentOf(lines[config]) + 2
+  let blockAt = -1
+  let blockEnd = -1
+  for (let i = config + 1; i < lines.length; i++) {
+    const line = lines[i]
+    if (line.trim() === '') continue
+    const ind = indentOf(line)
+    if (ind < blockIndent) break
+    if (ind === blockIndent && line.trim().startsWith(`${TOOL_CONFIG_KEY}:`)) {
+      blockAt = i
+      break
+    }
+  }
+  if (blockAt === -1) {
+    console.warn(`[dsh-subagent-vision] patch row ${ENTRY_ID} has no ${TOOL_CONFIG_KEY} block; skipping persist`)
+    return false
+  }
+  {
+    let end = blockAt + 1
+    while (end < lines.length && lines[end].trim() !== '' && indentOf(lines[end]) > blockIndent) end++
+    blockEnd = end
+  }
+  const keyIndent = blockIndent + 2
   const keyPad = ' '.repeat(keyIndent)
   const valuePad = ' '.repeat(keyIndent + 2)
-  // Locate an existing agentOptions block (the key line plus deeper children).
+  // Locate an existing agentOptions block inside visionTool (the key line plus
+  // deeper children).
   let optionsAt = -1
   let optionsEnd = -1
-  for (let i = config + 1; i < lines.length; i++) {
+  for (let i = blockAt + 1; i < blockEnd; i++) {
     const line = lines[i]
     if (line.trim() === '') continue
     const ind = indentOf(line)
@@ -558,11 +604,10 @@ export async function persistToolRoute(route) {
       optionsAt = i
       break
     }
-    if (ind === keyIndent) continue
   }
   if (optionsAt !== -1) {
     let end = optionsAt + 1
-    while (end < lines.length && lines[end].trim() !== '' && indentOf(lines[end]) > keyIndent) end++
+    while (end < blockEnd && lines[end].trim() !== '' && indentOf(lines[end]) > keyIndent) end++
     optionsEnd = end
   }
   // Preserve an existing maxTokens when present; fall back to the default.
@@ -585,7 +630,7 @@ export async function persistToolRoute(route) {
   if (existing.length === wanted.length && existing.every((line, i) => line === wanted[i])) return false
   const next = optionsAt !== -1
     ? [...lines.slice(0, optionsAt), ...wanted, ...lines.slice(optionsEnd)]
-    : insertAfterConfigKeys(lines, config, keyIndent, wanted)
+    : insertAfterConfigKeys(lines, blockAt, blockEnd, keyIndent, wanted)
   const result = next.join('\n')
   if (result === text) return false
   const tmp = `${PATCH_FILE}.tmp`
@@ -600,15 +645,13 @@ export async function persistToolRoute(route) {
   }
 }
 
-/** Insert lines after the last top-level config key of the tool row's config block. */
-function insertAfterConfigKeys(lines, config, keyIndent, wanted) {
-  let anchor = config
-  for (let i = config + 1; i < lines.length; i++) {
+/** Insert lines after the last key of the visionTool block, before its end. */
+function insertAfterConfigKeys(lines, blockAt, blockEnd, keyIndent, wanted) {
+  let anchor = blockAt
+  for (let i = blockAt + 1; i < blockEnd; i++) {
     const line = lines[i]
     if (line.trim() === '') continue
-    const ind = indentOf(line)
-    if (ind < keyIndent) break
-    if (ind === keyIndent) anchor = i
+    if (indentOf(line) === keyIndent) anchor = i
   }
   return [...lines.slice(0, anchor + 1), ...wanted, ...lines.slice(anchor + 1)]
 }
@@ -798,11 +841,11 @@ function registerVisionRouteHttp(scope, ctx, io) {
   })
 }
 
-/** The route currently declared on the tool row, or '' when the row has none. */
+/** The route currently declared on this entry's config, or '' when it has none. */
 function currentToolRoute(ctx) {
   try {
-    const entry = ctx.loader?.entries?.().find((e) => e.options?.id === TOOL_ENTRY_ID)
-    const agentOptions = entry?.options?.config?.agentOptions
+    const entry = ctx.loader?.entries?.().find((e) => e.options?.id === ENTRY_ID)
+    const agentOptions = entry?.options?.config?.[TOOL_CONFIG_KEY]?.agentOptions
     if (agentOptions?.provider && agentOptions?.model) return `${agentOptions.provider}/${agentOptions.model}`
   } catch {
     /* loader unavailable */
@@ -811,10 +854,10 @@ function currentToolRoute(ctx) {
 }
 
 /**
- * Point the tool row's agentOptions at the chosen route. The model must
- * resolve and declare image input; anything else logs a warning and leaves
- * the row untouched (the patch default keeps serving). No-op when the row
- * already matches.
+ * Point this entry's `visionTool.agentOptions` at the chosen route. The model
+ * must resolve and declare image input; anything else logs a warning and
+ * leaves the entry untouched (the patch default keeps serving). No-op when
+ * the entry already matches.
  *
  * Resolution is retried with backoff: at boot the llm route directory can
  * still be settling (dormant adapters register only after the settings
@@ -871,15 +914,20 @@ async function syncToolRouteOnce(ctx, route) {
   }
   try {
     const list = ctx.loader?.entries ? Array.from(ctx.loader.entries()) : []
-    const entry = list.find((e) => e.options?.id === TOOL_ENTRY_ID)
+    const entry = list.find((e) => e.options?.id === ENTRY_ID)
     if (!entry?.options?.config) return
-    const agentOptions = entry.options.config.agentOptions
+    const visionTool = entry.options.config[TOOL_CONFIG_KEY]
+    if (visionTool === undefined) return
+    const agentOptions = visionTool.agentOptions
     if (agentOptions?.provider === provider && agentOptions?.model === model) return
     const next = {
       ...entry.options,
       config: {
         ...entry.options.config,
-        agentOptions: { ...agentOptions, provider, model },
+        [TOOL_CONFIG_KEY]: {
+          ...visionTool,
+          agentOptions: { ...agentOptions, provider, model },
+        },
       },
     }
     // Update through the entry object itself: it is reachable via the tree

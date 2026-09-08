@@ -1,25 +1,24 @@
 // Verification smoke for dsh-subagent-vision.
-// Mounts the exact config the shipped patch declares on the REAL
-// tool-subagent plugin plus this package's host plugin (guide section +
-// paste-to-path route) and stubbed llm/webServer services, then asserts:
-//   1. the `subagent_vision` tool registers;
+// Mounts this package's host plugin with the exact `visionTool` config the
+// shipped patch declares (provider name swapped to a local scripted
+// ctx.subagents provider) on the REAL tools/subagents/system-prompt services
+// plus stubbed llm/webServer services, then asserts:
+//   1. the `subagent_vision` tool registers once the provider appears;
 //   2. executing it forwards the vision agentOptions into the start request;
 //   3. the guide prompt section renders into the assembled system prompt;
 //   4. the paste verdict answers true only for positively-confirmed
 //      text-only models (vision and unknown models stay native);
 //   5. POST /subagent-vision/paste sniffs, stores, and returns a temp path.
-// Run from the repository root:
-//   pnpm exec tsx plugins/dsh-subagent-vision/verify.mjs
+// Run from the plugin directory (after `npm install`):
+//   node verify.mjs
 // Exits non-zero on any failed assertion.
 import { readFile, stat } from 'node:fs/promises'
 import { Context } from '@deepseek-ai/cordis'
 import SystemPrompt, { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import SubagentRuntime from '@deepseek-ai/dsh-subagent'
-import { CallId } from '@deepseek-ai/dsh-llm'
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
-import * as tool from '../../packages/subagent/tool-subagent/src/index.ts'
-import { mountScriptedProvider } from '../../packages/subagent/tool-subagent/tests/scripted-provider.ts'
 import * as host from './index.js'
 
 let failures = 0
@@ -30,11 +29,46 @@ function check(label, ok, detail) {
 
 // The config the bundle patch ships, except `provider` is the scripted
 // provider name here (the patch's `spawn` is the deployment route).
-const PATCH_CONFIG = {
-  toolName: 'subagent_vision',
+const VISION_TOOL_CONFIG = {
   provider: 'mock',
-  backgroundMode: 'one-shot',
   agentOptions: { provider: 'pi-ai', model: 'qwen3.8-max', maxTokens: 16384 },
+}
+
+// A scripted one-shot provider registered through the real subagents service,
+// mirroring how the deployment's spawn backend registers. Captures each start
+// request and answers with fixed text.
+let seenStart
+function mountScriptedProvider(ctx, name) {
+  const capabilities = {
+    agentOptions: true,
+    outputSchema: false,
+    depthLimit: true,
+    toolFilter: false,
+    persona: false,
+  }
+  return ctx.plugin({
+    name: 'scripted-subagent-provider',
+    inject: ['subagents'],
+    apply(pluginCtx) {
+      pluginCtx.subagents.registerProvider({
+        name,
+        capabilities,
+        inheritsParentContext: false,
+        async start(request) {
+          seenStart = request
+          return {
+            id: SessionId(`scripted:${name}:${request.parent.id}`),
+            localAgent: undefined,
+            result: Promise.resolve({
+              output: [{ type: 'text', text: 'scripted subagent reply' }],
+              stopReason: 'completed',
+            }),
+            dispose: () => Promise.resolve(),
+          }
+        },
+      })
+    },
+  })
 }
 
 // Stubbed llm: a model is image-capable when its id mentions vision/qwen; an
@@ -91,33 +125,29 @@ await ctx.plugin(SubagentRuntime)
 ctx.provide('llm', stubLlm)
 ctx.provide('webServer', stubWebServer)
 
-// Capture the start request the tool builds, like the repo's agentOptions test.
-let seen
-await mountScriptedProvider(ctx, {
-  name: 'mock',
-  onStart(request) {
-    seen = request
-  },
-})
-await ctx.plugin(host)
-await ctx.plugin(tool, PATCH_CONFIG)
+// 1. Before the provider exists, the tool must not be visible.
+await ctx.plugin(host, { visionTool: VISION_TOOL_CONFIG, persistToPatch: false })
+check('tool absent before its provider registers', ctx.tools.get('subagent_vision') === undefined)
 
-// 1. The tool registers under the patch's toolName.
+// Registering the scripted provider makes the tool appear.
+await mountScriptedProvider(ctx, 'mock')
 check('subagent_vision tool is registered', ctx.tools.get('subagent_vision') !== undefined)
 
 // 2. Executing it forwards agentOptions and the prompt to the child boundary.
+// The fake parent carries the shape delegationDepthOf reads (options + session
+// header); a top-level parent sits at depth 0.
 const result = await ctx.tools.execute({
   signal: new AbortController().signal,
-  callId: CallId('verify-call-1'),
+  callId: ToolCallId('verify-call-1'),
   name: 'subagent_vision',
   arguments: { description: 'read the chart', prompt: 'Read /tmp/chart.png with read_image and summarize it' },
-  agent: { id: SessionId('parent-verify') },
+  agent: { id: SessionId('parent-verify'), options: {}, session: { header: { delegationDepth: 0 } } },
 })
 check(
   'start request carries the vision agentOptions',
-  seen?.agentOptions?.provider === 'pi-ai'
-    && seen?.agentOptions?.model === 'qwen3.8-max'
-    && seen?.agentOptions?.maxTokens === 16384,
+  seenStart?.agentOptions?.provider === 'pi-ai'
+    && seenStart?.agentOptions?.model === 'qwen3.8-max'
+    && seenStart?.agentOptions?.maxTokens === 16384,
 )
 const text = result.content.filter((b) => b.type === 'text').map((b) => b.text).join('')
 check('tool result returns the child text', text === 'scripted subagent reply')
