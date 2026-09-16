@@ -7,10 +7,12 @@
 //   2. the settings section registers under the subagent-vision namespace;
 //   3. the section's schema offers a select whose options are exactly the
 //      configured models that declare image input (provider/model routes);
-//   4. registering syncs the tool row's agentOptions when it differs;
-//   5. changing the setting re-syncs the tool row (maxTokens preserved);
+//   4. registering leaves the loader entry alone when the row already matches;
+//   5. changing the setting re-points the running tool without rewriting the
+//      loader entry that mounts this plugin (a rewrite would restart the
+//      fiber and re-register its routes);
 //   6. a route whose model cannot resolve, or does not declare image input,
-//      is refused and the tool row is left alone;
+//      is refused and the current route stays;
 //   7. splitVisionRoute handles provider/model strings and garbage.
 // Run: node verify-settings.mjs
 import { Context } from '@deepseek-ai/cordis'
@@ -283,25 +285,16 @@ if (reg) {
 check('guide prompt guides delegation when a route is chosen', sections[0].text().includes('delegates to a fresh subagent'))
 
 // 4: registration-time sync is a no-op when the row already matches
-check('no tool-row update when already matching', updates.length === 0, JSON.stringify(updates))
+check('no loader-entry rewrite when already matching', updates.length === 0, JSON.stringify(updates))
 
-// 5: a settings change re-syncs the tool row, preserving the rest of the config
+// 5: a settings change re-points the running tool WITHOUT rewriting the loader
+// entry. Rewriting the entry that mounts this plugin would restart its fiber,
+// whose apply() re-registers the paste and settings routes into the same
+// webServer scope ('duplicate exact route').
 userValue = { visionRoute: 'anthropic/claude-3.7' }
 await watchers[0]()
 await new Promise((r) => setTimeout(r, 150)) // resolve succeeds on the first attempt
-check('settings change updates the tool row', updates.length === 1)
-if (updates.length === 1) {
-  const next = updates[0].options.config.visionTool.agentOptions
-  check(
-    'tool row now routes to the chosen model',
-    updates[0].id === 'subagent-vision'
-      && next.provider === 'anthropic'
-      && next.model === 'claude-3.7'
-      && next.maxTokens === 16384,
-    JSON.stringify(next),
-  )
-  check('tool row config otherwise preserved', updates[0].options.config.visionTool.provider === 'spawn')
-}
+check('settings change does not rewrite the loader entry', updates.length === 0, JSON.stringify(updates))
 
 // 6a: an unresolvable route is refused (sync retries with backoff, then gives up)
 updates.length = 0
@@ -399,7 +392,7 @@ if (settingsRoute) {
   check('POST persists the choice', postRes.state.status === 200 && JSON.parse(postRes.state.body).ok === true)
   check('settings.replace received the choice', userValue?.visionRoute === 'anthropic/claude-3.7')
   await new Promise((r) => setTimeout(r, 150))
-  check('POST-triggered sync updates the tool row', updates.length === 1)
+  check('POST-triggered sync leaves the loader entry alone', updates.length === 0, JSON.stringify(updates))
   const badRes = fakeRes()
   await settingsRoute.handler(fakeReq('POST', '/subagent-vision/settings', [Buffer.from(JSON.stringify({ visionRoute: 'nope/nope' }))]), badRes)
   check('unknown route POST is refused', badRes.state.status === 400)

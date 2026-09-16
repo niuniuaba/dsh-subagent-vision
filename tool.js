@@ -92,24 +92,33 @@ async function settleStart(start, signal) {
 /**
  * Mount the `subagent_vision` tool onto the context.
  * @param ctx - plugin context carrying `tools`, `subagents`, and optionally `jobs`.
- * @param config - the tool block ({@link VisionToolConfig}): provider name,
- *   child agentOptions, tool name, and background enablement.
+ * @param config - the tool block: provider name, child agentOptions (an object,
+ *   or a function returning the current ones), tool name, and background enablement.
  */
 export function mountVisionTool(ctx, config = {}) {
   const toolName = config.toolName ?? DEFAULT_TOOL_NAME
   const provider = config.provider ?? 'spawn'
   const backgroundEnabled = config.enableRunInBackground !== false
-  const agentOptions = config.agentOptions
+  // Read per call: a settings change must take effect on the next delegation
+  // without re-applying this plugin's loader entry. Rewriting that entry
+  // restarts the plugin fiber, whose `apply()` re-registers the paste and
+  // settings routes into the same webServer scope.
+  const readAgentOptions = typeof config.agentOptions === 'function'
+    ? config.agentOptions
+    : () => config.agentOptions
 
   /** Build the start request shared by foreground and background routes. */
-  const buildRequest = (args, parent, signal) => ({
-    label: args.description,
-    prompt: [{ type: 'text', text: args.prompt }],
-    parent,
-    ...agentOptions !== undefined ? { agentOptions } : {},
-    maxDepth: MAX_CHILD_DEPTH,
-    signal,
-  })
+  const buildRequest = (args, parent, signal) => {
+    const agentOptions = readAgentOptions()
+    return {
+      label: args.description,
+      prompt: [{ type: 'text', text: args.prompt }],
+      parent,
+      ...agentOptions === undefined || agentOptions === null ? {} : { agentOptions },
+      maxDepth: MAX_CHILD_DEPTH,
+      signal,
+    }
+  }
 
   const definition = defineTool({
     name: toolName,

@@ -71,18 +71,61 @@ function mountScriptedProvider(ctx, name) {
   })
 }
 
-// Stubbed llm: a model is image-capable when its id mentions vision/qwen; an
-// unknown provider has no adapter, so resolveModelInfo rejects (the host route
-// must then answer false, not take over).
+// Stubbed llm: these model ids declare image input; every other id is
+// text-only. An unknown provider has no adapter, so resolveModelInfo rejects
+// (the paste route must then answer false, not take over).
+const IMAGE_MODEL_IDS = new Set(['qwen3.8-max', 'claude-3.7', 'deepseek-v4-flash-vision-exp'])
 const stubLlm = {
+  listConfigurableProviders: () => [
+    { provider: 'pi-ai', displayName: 'Qwen (DashScope)', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'qwen'] },
+    { provider: 'anthropic', displayName: 'Anthropic', settingsNs: 'llm-anthropic', settingsPath: [] },
+  ],
   resolveModelInfo: async (provider, model) => {
     if (provider === 'unknown-provider') throw new Error(`no adapter for ${provider}`)
     return {
       provider,
       model,
-      inputModalities: /vision|qwen/i.test(model) ? ['text', 'image'] : ['text'],
+      inputModalities: IMAGE_MODEL_IDS.has(model) ? ['text', 'image'] : ['text'],
     }
   },
+}
+
+// Stub settings service: the vision-route section records its change watcher
+// so this smoke can drive a settings change, and `get` serves no provider
+// documents (the picker then offers no options, which the route sync does not
+// depend on).
+const settingsWatchers = []
+let storedSettings = null
+const stubSettings = {
+  get: () => undefined,
+  describe: () => [],
+  installSection(owner, ns, schema, entry, hooks) {
+    if (ns !== 'subagent-vision') return
+    const scope = { get: () => storedSettings ?? entry, watch: (fn) => settingsWatchers.push(fn) }
+    hooks.setSource(() => scope.get())
+    hooks.onChange()
+    scope.watch(() => hooks.onChange())
+  },
+  replace(ns, section) {
+    if (ns !== 'subagent-vision') return
+    storedSettings = section
+    for (const fn of settingsWatchers) fn()
+  },
+}
+
+// Stub loader: records every entry rewrite. The plugin must never rewrite the
+// entry that mounts it — the loader restarts that fiber, re-registering the
+// paste and settings routes into the same webServer scope.
+const loaderRewrites = []
+const stubLoader = {
+  entries: () => [{
+    options: {
+      id: 'subagent-vision',
+      name: 'dsh-subagent-vision',
+      config: { visionTool: VISION_TOOL_CONFIG },
+    },
+    update: async (next) => { loaderRewrites.push(next) },
+  }],
 }
 
 const routes = []
@@ -124,6 +167,8 @@ await ctx.plugin(ToolRuntime)
 await ctx.plugin(SubagentRuntime)
 ctx.provide('llm', stubLlm)
 ctx.provide('webServer', stubWebServer)
+ctx.provide('settings', stubSettings)
+ctx.provide('loader', stubLoader)
 
 // 1. Before the provider exists, the tool must not be visible.
 await ctx.plugin(host, { visionTool: VISION_TOOL_CONFIG, persistToPatch: false })
@@ -158,6 +203,28 @@ check(
   'guide prompt section mentions subagent_vision and the model hint',
   prompt.includes('subagent_vision') && prompt.includes('a vision-capable model'),
 )
+
+// 3b. A settings change re-points the running tool on its next call, keeping
+// the row's maxTokens, and never rewrites the loader entry that mounts this
+// plugin (a rewrite restarts the fiber and re-registers its routes).
+await ctx.settings.replace('subagent-vision', { visionRoute: 'anthropic/claude-3.7' })
+await new Promise((resolve) => setTimeout(resolve, 200))
+const rerouted = await ctx.tools.execute({
+  signal: new AbortController().signal,
+  callId: ToolCallId('verify-call-2'),
+  name: 'subagent_vision',
+  arguments: { description: 'read the second chart', prompt: 'Read /tmp/chart2.png and summarize it' },
+  agent: { id: SessionId('parent-verify'), options: {}, session: { header: { delegationDepth: 0 } } },
+})
+check(
+  'settings change re-points the running tool',
+  seenStart?.agentOptions?.provider === 'anthropic'
+    && seenStart?.agentOptions?.model === 'claude-3.7'
+    && seenStart?.agentOptions?.maxTokens === 16384,
+  JSON.stringify(seenStart?.agentOptions),
+)
+check('rerouted call still returns the child text', rerouted.isError !== true)
+check('loader entry is never rewritten', loaderRewrites.length === 0, JSON.stringify(loaderRewrites))
 
 // 4. Paste verdict: text-only -> takeover; image-capable and unknown -> native.
 const route = routes.find((r) => r.path === '/subagent-vision/paste')

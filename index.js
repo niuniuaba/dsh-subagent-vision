@@ -28,11 +28,10 @@
 // verdict trusts. That makes adapter-shipped vision models (e.g.
 // llm-deepseek's deepseek-v4-flash-vision-exp) selectable even when their
 // settings entries never name a modality. The choice is stored in the
-// settings system (settings.yaml, GUI-editable, survives restarts) AND
-// persisted into this bundle's own cordis.patch.yml, so the tool starts with
-// the chosen agentOptions on the next boot even if the runtime
-// settings->config sync cannot apply it live. Clearing the choice removes the
-// hardcode again.
+// settings system (settings.yaml, GUI-editable, survives restarts), applied
+// to the running tool immediately, and persisted into this bundle's own
+// cordis.patch.yml so the next boot starts from it before the settings
+// settle. Clearing the choice removes the hardcode again.
 import z from '@deepseek-ai/schemastery'
 import { readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
@@ -200,16 +199,30 @@ function registerPasteRoute(scope, host, options) {
 // its current state lazily.
 let visionRoute = null
 
+// The validated route the tool delegates with, or null while the row's
+// configured baseline applies. Kept here rather than written back into the
+// loader entry: rewriting the entry that mounts this plugin restarts its
+// fiber, and the restarted `apply()` re-registers the paste and settings
+// routes into the same webServer scope ('duplicate exact route').
+let activeToolRoute = null
+
 export function apply(ctx, config = {}) {
   const visionTool = config.visionTool === false ? {} : (config.visionTool ?? {})
   // One tool name drives both halves: the guide prompt and the tool definition.
   const toolName = visionTool.toolName ?? config.toolName ?? 'subagent_vision'
   const modelHint = config.modelHint ?? 'a vision-capable model'
   if (config.visionTool !== false && typeof ctx.tools?.register === 'function' && typeof ctx.subagents?.getProvider === 'function') {
-    // The tool half runs inside this fiber: the same entry's `visionTool`
-    // block carries its provider and child agentOptions. A stubbed context
-    // without those services (the settings smoke) leaves the guide-only plugin.
-    mountVisionTool(ctx, { ...visionTool, toolName })
+    // The tool half runs inside this fiber. Its child route is the row's
+    // configured baseline until the settings choice validates, then the live
+    // choice — resolved per call, so no loader entry is rewritten.
+    const baseline = visionTool.agentOptions
+    mountVisionTool(ctx, {
+      ...visionTool,
+      toolName,
+      agentOptions: () => activeToolRoute === null
+        ? baseline
+        : { ...(baseline ?? {}), provider: activeToolRoute.provider, model: activeToolRoute.model },
+    })
   }
   ctx.systemPrompt.section({
     name: 'subagent-vision',
@@ -688,13 +701,13 @@ function queuePersistSelectable(ctx, route) {
 }
 
 /**
- * Register the vision-route settings section and sync the choice onto the
- * tool row whenever it settles. Registration is conditional: a deployment
- * without the settings service simply leaves the tool row as patched.
+ * Register the vision-route settings section and point the running tool at
+ * the choice whenever it settles. Registration is conditional: a deployment
+ * without the settings service simply leaves the row's configured baseline.
  * The choice is stored in the settings system AND, when the user picks one,
- * persisted into this bundle's own cordis.patch.yml — so the tool row starts
- * with the chosen agentOptions on the next boot even if the live sync cannot
- * apply it. Clearing the choice removes the hardcoded block again.
+ * persisted into this bundle's own cordis.patch.yml — so the next boot starts
+ * from it even before the settings settle. Clearing the choice removes the
+ * hardcoded block again.
  * @param ctx - plugin context carrying llm (and optionally loader/settings).
  * @param config - the plugin config (persistToPatch gates the file write).
  */
@@ -743,9 +756,10 @@ function registerVisionRouteSettings(ctx, config) {
     // HTTP read/write for the client picker. The client settings RPC only
     // serves a hardcoded allowlist of namespaces, so the picker talks to this
     // plugin's own route instead; storage still goes through the settings
-    // system (the watch on the section re-syncs the tool row). Reads enumerate
-    // live: dormant providers may only register their configurable-provider
-    // directory after boot, so the boot-time snapshot would stay empty.
+    // system (the watch on the section re-points the running tool). Reads
+    // enumerate live: dormant providers may only register their
+    // configurable-provider directory after boot, so the boot-time snapshot
+    // would stay empty.
     ctx.inject(['webServer'], (scope) => {
       try {
         registerVisionRouteHttp(scope, ctx, {
@@ -854,10 +868,15 @@ function currentToolRoute(ctx) {
 }
 
 /**
- * Point this entry's `visionTool.agentOptions` at the chosen route. The model
- * must resolve and declare image input; anything else logs a warning and
- * leaves the entry untouched (the patch default keeps serving). No-op when
- * the entry already matches.
+ * Point the running tool at the chosen route. The model must resolve and
+ * declare image input; anything else logs a warning and leaves the current
+ * route in place (the row baseline or the previous choice keeps serving).
+ *
+ * Only plugin state changes here. The entry that mounts this plugin is never
+ * rewritten: the loader restarts a fiber whose `config` changed, and the
+ * restarted `apply()` would re-register the paste and settings routes into
+ * the same webServer scope. Persisting the choice for the next boot is
+ * {@link persistToolRoute}'s job.
  *
  * Resolution is retried with backoff: at boot the llm route directory can
  * still be settling (dormant adapters register only after the settings
@@ -887,7 +906,12 @@ function queueToolRouteSync(ctx, route) {
 
 async function syncToolRouteOnce(ctx, route) {
   const [provider, model] = splitVisionRoute(route)
-  if (!provider || !model) return
+  // An empty or unparsable choice clears the live route: the row baseline
+  // applies again.
+  if (!provider || !model) {
+    activeToolRoute = null
+    return
+  }
   let lastError
   let resolved = false
   let image = false
@@ -905,36 +929,13 @@ async function syncToolRouteOnce(ctx, route) {
     }
   }
   if (!resolved) {
-    console.warn(`[dsh-subagent-vision] configured vision route ${provider}/${model} cannot be resolved (${lastError?.message ?? lastError}); leaving the tool row as patched`)
+    console.warn(`[dsh-subagent-vision] configured vision route ${provider}/${model} cannot be resolved (${lastError?.message ?? lastError}); keeping the current route`)
     return
   }
   if (!image) {
-    console.warn(`[dsh-subagent-vision] configured vision route ${provider}/${model} does not declare image input; leaving the tool row as patched`)
+    console.warn(`[dsh-subagent-vision] configured vision route ${provider}/${model} does not declare image input; keeping the current route`)
     return
   }
-  try {
-    const list = ctx.loader?.entries ? Array.from(ctx.loader.entries()) : []
-    const entry = list.find((e) => e.options?.id === ENTRY_ID)
-    if (!entry?.options?.config) return
-    const visionTool = entry.options.config[TOOL_CONFIG_KEY]
-    if (visionTool === undefined) return
-    const agentOptions = visionTool.agentOptions
-    if (agentOptions?.provider === provider && agentOptions?.model === model) return
-    const next = {
-      ...entry.options,
-      config: {
-        ...entry.options.config,
-        [TOOL_CONFIG_KEY]: {
-          ...visionTool,
-          agentOptions: { ...agentOptions, provider, model },
-        },
-      },
-    }
-    // Update through the entry object itself: it is reachable via the tree
-    // walk (entries), while a bare-id loader.update can miss nested rows.
-    await entry.update(next, false, true)
-    console.log(`[dsh-subagent-vision] vision route set to ${provider}/${model}`)
-  } catch (error) {
-    console.error(`[dsh-subagent-vision] could not apply vision route ${provider}/${model}: ${error?.message ?? error}`)
-  }
+  activeToolRoute = { provider, model }
+  console.log(`[dsh-subagent-vision] vision route set to ${provider}/${model}`)
 }
