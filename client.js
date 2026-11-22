@@ -1,25 +1,17 @@
-// Browser half of dsh-subagent-vision: send-time image-to-path conversion +
-// the vision-route picker (Settings > 视觉处理模型).
+// dsh-subagent-vision browser half (0.2.x port): send-time image-to-path
+// conversion + the vision-route picker (Settings → Vision model).
 //
-// Intake is left ENTIRELY native: pasting or dropping an image shows the
-// composer's own thumbnail rail, the native caret behaviour, and the native
-// remove/undo affordances. This plugin's only interception is at SEND time:
-// when a draft carries image attachments and the target session's model is
-// positively confirmed text-only (the host's verdict from provider metadata,
-// cached 60 s), each draft image is uploaded to the host route
-// (POST /subagent-vision/paste -> private temp file path), the draft is
-// released, and the paths are appended to the prompt text before the real
-// send — so the request carries text only and never trips image admission.
-// Image-capable models and unknown models send natively (attachments go
-// through unchanged).
+// Intake stays native (thumbnail rail, caret, remove/undo). The only
+// interception is at SEND time: when a draft carries image attachments, each
+// image is uploaded to the host route (POST /subagent-vision/paste -> private
+// temp file path), the draft is released, and the paths are appended to the
+// prompt text before the real send — so the request carries text only and
+// never trips the host's text-only image admission. The main agent then
+// delegates each path to `subagent_vision`.
 //
-// The vision-route picker registers a settings.section entry; it reads and
-// writes through the plugin's own /subagent-vision/settings route (the client
-// settings RPC serves only a hardcoded namespace allowlist), rendering the
-// dropdown with hand-written React via createElement.
-//
-// Hand-written in the lazy-CJS bundle protocol
-// (window.__ModuleLoader__.load), so no build step.
+// The picker registers a Settings section (`settings.section` slot, same as
+// 0.1.x) whose dropdown reads the live vision-model list from
+// GET /subagent-vision/settings and persists the choice via POST.
 window.__ModuleLoader__.load({
   id: 'dsh-subagent-vision',
   factory: (require) => {
@@ -27,18 +19,13 @@ window.__ModuleLoader__.load({
     var exports = module.exports
     var React = require('react')
 
-    var VERDICT_MAX_AGE_MS = 60000
     var routeAvailable = true
-    var verdicts = {}
 
-    // Upload one image to the host route; resolves to the stored temp path.
     function uploadOne(file) {
       return file.arrayBuffer().then((buffer) =>
         fetch('/subagent-vision/paste', { method: 'POST', body: buffer }).then((res) => {
           if (!res.ok) {
-            return res
-              .json()
-              .catch(() => ({}))
+            return res.json().catch(() => ({}))
               .then((body) => {
                 var error = new Error(body.error || `paste upload failed (${res.status})`)
                 error.status = res.status
@@ -50,256 +37,115 @@ window.__ModuleLoader__.load({
       )
     }
 
-    // Whether the target session's model is positively confirmed text-only:
-    // the host's verdict from inputModalities, never a name guess. Unknown
-    // (unresolvable model, route gone) answers false, keeping the intake
-    // native for anything we cannot confirm.
-    function textOnlyFor(ctx, sessionId) {
-      return ctx.connection.api.sessions
-        .models({ sessionId })
-        .then((res) => {
-          if (!res.result?.ok) return false
-          var selection = res.result.value?.current
-          if (!selection?.provider || !selection?.model) return false
-          var key = JSON.stringify([selection.provider, selection.model])
-          var cached = verdicts[key]
-          if (cached && !cached.pending && Date.now() - cached.at <= VERDICT_MAX_AGE_MS) {
-            return cached.takeover === true
-          }
-          var entry = { pending: true, takeover: cached ? cached.takeover : false, at: cached ? cached.at : 0 }
-          verdicts[key] = entry
-          return fetch(
-            `/subagent-vision/paste?provider=${encodeURIComponent(selection.provider)}&model=${encodeURIComponent(selection.model)}`,
-          )
-            .then((res) => {
-              if (res.status === 404) {
-                routeAvailable = false
-                entry.pending = false
-                return false
-              }
-              if (!res.ok) throw new Error(`policy ${res.status}`)
-              return res.json()
-            })
-            .then((body) => {
-              entry.pending = false
-              if (body) {
-                entry.takeover = body.takeover === true
-                entry.at = Date.now()
-              }
-              return entry.takeover === true
-            })
-            .catch(() => {
-              entry.pending = false
-              return false
-            })
-        })
-        .catch(() => false)
-    }
-
-    // Wrap the conversation service's sendSession: on a text-only session,
-    // turn draft image attachments into temp paths appended to the prompt
-    // before sending, so the request carries no image blocks.
-    function wrapSendSession(ctx, conversation) {
+    function wrapSendSession(conversation) {
       var original = conversation.sendSession.bind(conversation)
-      conversation.sendSession = async function (session, text, imageIds, mode) {
-        if (imageIds.length === 0 || !routeAvailable) return original(session, text, imageIds, mode)
-        var textOnly = await textOnlyFor(ctx, session.sessionId)
-        if (!textOnly) return original(session, text, imageIds, mode)
-        var attachments = conversation.draftImages(imageIds)
-        if (attachments.length === 0) return original(session, text, imageIds, mode)
+      conversation.sendSession = async function (session, text, attachmentIds, mode, signal, accept) {
+        if (attachmentIds.length === 0 || !routeAvailable) {
+          return original(session, text, attachmentIds, mode, signal, accept)
+        }
+        if (typeof conversation.resolveDraftAttachments !== 'function') {
+          return original(session, text, attachmentIds, mode, signal, accept)
+        }
+        var attachments = conversation.resolveDraftAttachments(attachmentIds)
+        if (attachments.length !== attachmentIds.length) {
+          return original(session, text, attachmentIds, mode, signal, accept)
+        }
+        if (attachments.some((a) => a.kind !== 'image')) {
+          return original(session, text, attachmentIds, mode, signal, accept)
+        }
         var paths = []
         for (var i = 0; i < attachments.length; i++) {
-          // A failed upload aborts the send; the composer's sink restores the
-          // draft and thumbnails (its usual send-failure recovery).
           var result = await uploadOne(attachments[i].file)
           if (result && typeof result.path === 'string') paths.push(result.path)
         }
-        conversation.releaseDraftImages(attachments)
+        if (typeof conversation.releaseDraftAttachments === 'function') {
+          try { conversation.releaseDraftAttachments(attachments) } catch (_) {}
+        }
         var finalText = text === '' ? paths.join(' ') : `${text} ${paths.join(' ')}`
-        return original(session, finalText, [], mode)
+        return original(session, finalText, [], mode, signal, accept)
       }
     }
 
-    // ---- vision-route settings entry (Settings > 视觉处理模型) ----
-    //
-    // A self-contained settings.section: the dropdown lists the models the
-    // host enumerated (live re-read through the plugin route), the current
-    // value comes from the namespace document, and saving issues a settings
-    // mutate. When the host has no selectable options it shows the hint it put
-    // on the field — "configure a vision model in Settings > Models first" —
-    // and, when configured models exist but none declares image input (the
-    // Models surface cannot express input modalities), lists them with a
-    // one-click "declare image input" button that writes `input: [text, image]`
-    // into that model's settings entry. No build step: hand-written React via
-    // createElement.
     function VisionRouteSection() {
       var h = React.createElement
       var useState = React.useState
       var useEffect = React.useEffect
-      var [state, setState] = useState({ status: 'loading', options: [], undecided: [], current: '', hint: '' })
-      function load() {
-        return fetch('/subagent-vision/settings')
-          .then((res) => res.json())
-          .then((data) => {
-            setState({
-              status: 'ready',
-              options: Array.isArray(data.options) ? data.options : [],
-              undecided: Array.isArray(data.undecided) ? data.undecided : [],
-              current: typeof data.current === 'string' ? data.current : '',
-              hint: typeof data.hint === 'string' ? data.hint : '',
-            })
+
+      var state = useState({ loading: true, options: [], current: '', error: null })
+      var options = state[0].options
+      var current = state[0].current
+      var loading = state[0].loading
+      var error = state[0].error
+      var setState = state[1]
+
+      useEffect(function () {
+        fetch('/subagent-vision/settings')
+          .then(function (res) { return res.json() })
+          .then(function (body) {
+            setState({ loading: false, options: body.options || [], current: body.current || '', error: null })
           })
-          .catch((error) => {
-            setState({ status: 'error', options: [], undecided: [], current: '', hint: String(error?.message ?? error) })
+          .catch(function (err) {
+            setState({ loading: false, options: [], current: '', error: String(err && err.message || err) })
           })
-      }
-      useEffect(() => {
-        load()
       }, [])
-      function onSelect(event) {
-        var value = event.target.value
+
+      function onChange(ev) {
+        var value = ev.target.value
+        setState({ loading: false, options: options, current: value, error: null })
         fetch('/subagent-vision/settings', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ visionRoute: value }),
         })
-          .then((res) => res.json())
-          .then((data) => {
-            if (data.ok === true) setState((s) => Object.assign({}, s, { current: data.current }))
-          })
-          .catch(() => {
-            /* keep the previous value on failure */
-          })
-      }
-      function declareImage(provider, model) {
-        fetch('/subagent-vision/settings', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ action: 'declareImage', provider, model }),
-        })
-          .then((res) => {
-            // 404: the running host predates the declare route (plugin not
-            // restarted). Fall back to the manual hint instead of a dead button.
-            if (res.status === 404) {
-              setState((s) =>
-                Object.assign({}, s, {
-                  status: 'error',
-                  hint: '「声明支持图片输入」需要重启 dsh 生效（宿主路由尚未加载）。也可直接编辑 settings.yaml：在该模型的 models 条目中添加 input: [text, image]。',
-                }),
-              )
-              return null
+          .then(function (res) {
+            if (!res.ok) {
+              return res.json().catch(function () { return {} }).then(function (body) {
+                throw new Error(body.error || `save failed (${res.status})`)
+              })
             }
             return res.json()
           })
-          .then((data) => {
-            if (data && data.ok === true) {
-              // The model now declares image input: refresh the list so the
-              // dropdown appears with it selectable.
-              load()
-            }
+          .then(function (body) {
+            setState({ loading: false, options: options, current: body.current || '', error: null })
           })
-          .catch(() => {
-            /* keep the previous state on failure */
+          .catch(function (err) {
+            setState({ loading: false, options: options, current: current, error: String(err && err.message || err) })
           })
       }
-      var style = { width: '100%', minHeight: '34px', boxSizing: 'border-box' }
-      var labelStyle = { margin: '0 0 6px', fontSize: '13px', fontWeight: 500, color: 'var(--dsw-alias-label-primary, #222)' }
-      var hintStyle = { margin: '4px 0 8px', color: 'var(--dsw-alias-label-tertiary, #888)' }
-      var rowStyle = { display: 'flex', alignItems: 'center', gap: '8px', margin: '6px 0', fontSize: '13px' }
-      var nameStyle = { flex: '1', minWidth: '0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
-      var buttonStyle = {
-        boxSizing: 'border-box',
-        height: '28px',
-        border: 'none',
-        borderRadius: '14px',
-        cursor: 'pointer',
-        padding: '0 12px',
-        fontSize: '12px',
-        lineHeight: '28px',
-        background: 'var(--dsw-alias-button-primary-fill, #2563eb)',
-        color: 'var(--dsw-alias-label-primary-foreground, #fff)',
-        flex: 'none',
-      }
-      var body
-      if (state.status === 'ready' && state.options.length > 0) {
-        body = h(
-          'div',
-          { key: 'picker' },
-          h('p', { key: 'label', style: labelStyle, 'data-testid': 'vision-route-label' }, '请选择视觉处理模型'),
-          h(
-            'select',
-            { key: 'select', value: state.current, onChange: onSelect, style: style, 'data-testid': 'vision-route-select' },
-            state.current === '' ? h('option', { key: 'empty', value: '' }, '—') : null,
-            state.options.map((option) => h('option', { key: option.value, value: option.value }, option.label)),
-          ),
-        )
-      } else if (state.status === 'ready' && state.undecided.length > 0) {
-        body = h(
-          'div',
-          { key: 'undecided' },
-          h('p', { key: 'hint', style: hintStyle, 'data-testid': 'vision-route-hint' }, state.hint),
-          h(
-            'ul',
-            { key: 'list', style: { listStyle: 'none', margin: '0', padding: '0' } },
-            state.undecided.map((entry) =>
-              h(
-                'li',
-                { key: `${entry.provider}/${entry.model}`, style: rowStyle },
-                h(
-                  'span',
-                  { key: 'name', style: nameStyle },
-                  `${entry.displayName || entry.provider}: ${entry.modelName || entry.model}`,
-                ),
-                h(
-                  'button',
-                  {
-                    key: 'declare',
-                    type: 'button',
-                    style: buttonStyle,
-                    'data-testid': `vision-route-declare-${entry.provider}-${entry.model}`,
-                    onClick: () => declareImage(entry.provider, entry.model),
-                  },
-                  '声明支持图片输入',
-                ),
-              ),
+
+      return h('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px', padding: '8px 0' } },
+        h('div', null, 'Vision model for subagent_vision'),
+        loading
+          ? h('div', null, 'Loading…')
+          : h('select', { value: current, onChange: onChange, style: { maxWidth: '100%' } },
+              h('option', { value: '' }, '— none —'),
+              options.map(function (o) {
+                return h('option', { key: o.value, value: o.value }, o.label)
+              }),
             ),
-          ),
-        )
-      } else if (state.status === 'ready') {
-        body = h('p', { key: 'hint', style: hintStyle }, state.hint || '…')
-      } else if (state.status === 'loading') {
-        body = h('p', { key: 'loading', style: hintStyle }, '…')
-      } else {
-        body = h('p', { key: 'error', style: { margin: '4px 0', color: 'var(--dsw-alias-state-error-primary, #c0392b)' } }, state.hint)
-      }
-      return h('div', { 'data-testid': 'vision-route-section' }, body)
+        error ? h('div', { style: { color: 'var(--dsw-color-danger, #c0392b)' } }, String(error)) : null,
+      )
     }
 
     function apply(ctx) {
-      // Send-time conversion: only when the conversation service is present.
       var conversation = ctx.conversation || (typeof ctx.get === 'function' ? ctx.get('conversation') : undefined)
-      if (conversation && typeof conversation.sendSession === 'function' && typeof conversation.draftImages === 'function') {
-        wrapSendSession(ctx, conversation)
+      if (conversation && typeof conversation.sendSession === 'function') {
+        wrapSendSession(conversation)
       }
-      // Settings entry: the vision-route picker card. Only when the client
-      // slots service (the settings shell) is present.
-      if (ctx.slots && typeof ctx.slots.inject === 'function') {
-        ctx.slots.inject('settings.section', () =>
-          ctx.slots.register(
-            {
-              name: 'settings.section',
-              id: 'subagent-vision',
-              order: 100,
-              label: '视觉处理模型',
-            },
-            VisionRouteSection,
-          ),
-        )
+      var slots = ctx.slots
+      if (slots && typeof slots.inject === 'function') {
+        slots.inject('settings.section', () => slots.register({
+          name: 'settings.section',
+          id: 'subagent-vision',
+          order: 100,
+          label: () => 'Vision model',
+          inject: () => ({}),
+        }, VisionRouteSection))
       }
     }
 
     exports.apply = apply
-    exports.inject = ['connection', 'sessions', 'slots', 'conversation']
+    exports.inject = ['conversation', 'slots']
     return module.exports
   },
 })
