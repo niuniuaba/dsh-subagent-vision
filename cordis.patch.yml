@@ -7,17 +7,13 @@
 #
 # The tool is implemented by this package (tool.js) on the public
 # ctx.subagents / ctx.tools seams; the patch inserts exactly one row. The row
-# also mounts the host plugin half (guide prompt section).
+# also mounts the host plugin half (guide prompt + paste-to-path + settings).
 #
-# The `visionTool.agentOptions` block pins the child's LLM route. Edit the
-# provider/model here to point at a vision-capable model your deployment has.
+# `visionRoute` pins the child's LLM route as `provider/model`; it is a
+# volatile Config field, editable in Settings (and via the picker served by
+# this plugin's client half).
 - insert:
     - id: subagent-vision
       name: 'dsh-subagent-vision'
       config:
-        visionTool:
-          provider: spawn
-          agentOptions:
-            provider: polza
-            model: deepseek/deepseek-v4.1-flash-1017
-            maxTokens: 16384
+        visionRoute: 'polza/deepseek/deepseek-v4.1-flash-1017'
