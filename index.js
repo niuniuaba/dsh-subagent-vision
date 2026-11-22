@@ -9,7 +9,7 @@
 // vision-capable models for the picker.
 import { Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { mkdtemp, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { mountVisionTool } from './tool.js'
@@ -59,6 +59,39 @@ async function enumerateVisionRoutes(llm) {
     }
   }
   return routes
+}
+
+async function enumeratePolzaVisionRoutes() {
+  const home = process.env.DSH_HOME
+  if (!home) return []
+  try {
+    const data = JSON.parse(await readFile(join(home, 'polza', 'catalog.json'), 'utf8'))
+    const routes = []
+    for (const model of data.models ?? []) {
+      if (typeof model?.id !== 'string' || model.id === '') continue
+      if (!Array.isArray(model.inputModalities) || !model.inputModalities.includes('image')) continue
+      routes.push({ value: `polza/${model.id}`, label: `Polza: ${model.name || model.id}` })
+    }
+    return routes
+  } catch {
+    return []
+  }
+}
+
+function mergeRoutes(lists, current) {
+  const seen = new Set()
+  const out = []
+  for (const list of lists) {
+    for (const route of list ?? []) {
+      if (typeof route?.value !== 'string' || route.value === '' || seen.has(route.value)) continue
+      seen.add(route.value)
+      out.push(route)
+    }
+  }
+  if (current !== '' && current !== undefined && !seen.has(current)) {
+    out.unshift({ value: current, label: current })
+  }
+  return out
 }
 
 function registerPasteRoute(scope, options) {
@@ -174,9 +207,14 @@ export class SubagentVisionPlugin extends Service {
           path: '/subagent-vision/settings',
           handler: async (req, res) => {
             if (req.method === 'GET') {
-              const options = await enumerateVisionRoutes(ctx.llm).catch(() => [])
+              const current = this.config.visionRoute.get() ?? ''
+              const [adapter, polza] = await Promise.all([
+                enumerateVisionRoutes(ctx.llm).catch(() => []),
+                enumeratePolzaVisionRoutes(),
+              ])
+              const options = mergeRoutes([adapter, polza], current)
               res.writeHead(200, { 'content-type': 'application/json' })
-              res.end(JSON.stringify({ options, current: this.config.visionRoute.get() ?? '' }))
+              res.end(JSON.stringify({ options, current }))
               return
             }
             if (req.method !== 'POST') {
@@ -190,7 +228,12 @@ export class SubagentVisionPlugin extends Service {
               const route = parsed.visionRoute
               if (typeof route !== 'string') throw new Error('visionRoute must be a string')
               if (route !== '') {
-                const options = await enumerateVisionRoutes(ctx.llm).catch(() => [])
+                const current = this.config.visionRoute.get() ?? ''
+                const [adapter, polza] = await Promise.all([
+                  enumerateVisionRoutes(ctx.llm).catch(() => []),
+                  enumeratePolzaVisionRoutes(),
+                ])
+                const options = mergeRoutes([adapter, polza], current)
                 if (options.length > 0 && !options.some((o) => o.value === route)) {
                   throw new Error(`unknown vision route ${JSON.stringify(route)}`)
                 }
