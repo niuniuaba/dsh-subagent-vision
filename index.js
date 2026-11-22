@@ -65,12 +65,18 @@ async function enumeratePolzaVisionRoutes() {
   const home = process.env.DSH_HOME
   if (!home) return []
   try {
-    const data = JSON.parse(await readFile(join(home, 'polza', 'catalog.json'), 'utf8'))
+    const [whitelist, catalog] = await Promise.all([
+      readFile(join(home, 'polza', 'models.json'), 'utf8').then(JSON.parse),
+      readFile(join(home, 'polza', 'catalog.json'), 'utf8').then(JSON.parse),
+    ])
+    const byId = new Map((catalog.models ?? []).map((m) => [m.id, m]))
     const routes = []
-    for (const model of data.models ?? []) {
-      if (typeof model?.id !== 'string' || model.id === '') continue
+    for (const id of Array.isArray(whitelist) ? whitelist : []) {
+      if (typeof id !== 'string' || id === '') continue
+      const model = byId.get(id)
+      if (model === undefined) continue
       if (!Array.isArray(model.inputModalities) || !model.inputModalities.includes('image')) continue
-      routes.push({ value: `polza/${model.id}`, label: `Polza: ${model.name || model.id}` })
+      routes.push({ value: `polza/${id}`, label: `Polza: ${model.name || id}` })
     }
     return routes
   } catch {
