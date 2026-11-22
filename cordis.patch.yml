@@ -19,5 +19,5 @@
           provider: spawn
           agentOptions:
             provider: polza
-            model: deepseek/deepseek-v4-pro-0813
+            model: deepseek/deepseek-v4.1-flash-1017
             maxTokens: 16384
