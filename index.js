@@ -9,6 +9,7 @@
 // vision-capable models for the picker.
 import { Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
+import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -62,12 +63,10 @@ async function enumerateVisionRoutes(llm) {
 }
 
 async function enumeratePolzaVisionRoutes() {
-  const home = process.env.DSH_HOME
-  if (!home) return []
   try {
     const [whitelist, catalog] = await Promise.all([
-      readFile(join(home, 'polza', 'models.json'), 'utf8').then(JSON.parse),
-      readFile(join(home, 'polza', 'catalog.json'), 'utf8').then(JSON.parse),
+      readFile(dshHomePath('polza', 'models.json'), 'utf8').then(JSON.parse),
+      readFile(dshHomePath('polza', 'catalog.json'), 'utf8').then(JSON.parse),
     ])
     const byId = new Map((catalog.models ?? []).map((m) => [m.id, m]))
     const routes = []
